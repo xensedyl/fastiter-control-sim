@@ -32,24 +32,40 @@ class CMakeBuild(build_ext):
 
         configuration = "Debug" if self.debug else "Release"
         build_dir = (
-            Path(self.build_temp).resolve()
+            PROJECT_ROOT
+            / "build"
+            / "setuptools"
+            / configuration
             / extension.name.replace(".", "_")
-        )
+        ).resolve()
         build_dir.mkdir(parents=True, exist_ok=True)
 
         build_environment = os.environ.copy()
         conda_prefix = build_environment.get("CONDA_PREFIX")
         if conda_prefix:
+            conda_prefix_path = Path(conda_prefix)
+            if sys.platform == "win32":
+                conda_library = conda_prefix_path / "Library"
+                self._prepend_path(
+                    build_environment,
+                    "PATH",
+                    str(conda_library / "bin"),
+                )
+                pkg_config_dir = conda_library / "lib" / "pkgconfig"
+            else:
+                conda_library = conda_prefix_path
+                pkg_config_dir = conda_prefix_path / "lib" / "pkgconfig"
             self._prepend_path(
                 build_environment,
                 "PKG_CONFIG_PATH",
-                str(Path(conda_prefix) / "lib" / "pkgconfig"),
+                str(pkg_config_dir),
             )
-            self._prepend_path(
-                build_environment,
-                "LD_LIBRARY_PATH",
-                str(Path(conda_prefix) / "lib"),
-            )
+            if sys.platform != "win32":
+                self._prepend_path(
+                    build_environment,
+                    "LD_LIBRARY_PATH",
+                    str(conda_prefix_path / "lib"),
+                )
 
         cmake_arguments = [
             f"-DCMAKE_BUILD_TYPE={configuration}",
@@ -60,7 +76,12 @@ class CMakeBuild(build_ext):
             "-DPKG_CONFIG_USE_CMAKE_PREFIX_PATH=ON",
         ]
         if conda_prefix:
-            cmake_arguments.append(f"-DCMAKE_PREFIX_PATH={conda_prefix}")
+            cmake_prefixes = [conda_prefix]
+            if sys.platform == "win32":
+                cmake_prefixes.append(str(Path(conda_prefix) / "Library"))
+            cmake_arguments.append(
+                f"-DCMAKE_PREFIX_PATH={';'.join(cmake_prefixes)}"
+            )
 
         pybind11_dir = self._pybind11_cmake_dir(build_environment)
         if pybind11_dir:
@@ -74,15 +95,25 @@ class CMakeBuild(build_ext):
             f"Configuring {extension.name} with CMake ({configuration})",
             level=3,
         )
-        subprocess.run(
+        configure_command = [cmake]
+        if (
+            sys.platform == "win32"
+            and build_environment.get("FR3_SIM_USE_MINGW") == "1"
+            and "CMAKE_GENERATOR" not in build_environment
+            and shutil.which("g++", path=build_environment.get("PATH")) is not None
+        ):
+            configure_command.extend(["-G", "MinGW Makefiles"])
+        configure_command.extend(
             [
-                cmake,
                 "-S",
                 extension.source_dir,
                 "-B",
                 str(build_dir),
                 *cmake_arguments,
-            ],
+            ]
+        )
+        subprocess.run(
+            configure_command,
             check=True,
             env=build_environment,
         )
@@ -107,7 +138,14 @@ class CMakeBuild(build_ext):
         )
 
         if not extension_path.is_file():
-            candidates = sorted(extension_dir.glob("_fr3_sim*.so"))
+            candidates = sorted(
+                path
+                for path in extension_dir.rglob("_fr3_sim*")
+                if path.is_file()
+            )
+            if candidates:
+                shutil.copy2(candidates[0], extension_path)
+                return
             found = ", ".join(str(path.name) for path in candidates) or "none"
             raise RuntimeError(
                 f"CMake completed but did not produce {extension_path.name}. "
@@ -133,6 +171,14 @@ class CMakeBuild(build_ext):
         # module, while the real CMake executable remains usable here.
         conda_prefix = os.environ.get("CONDA_PREFIX")
         if conda_prefix:
+            if sys.platform == "win32":
+                windows_candidates = (
+                    Path(conda_prefix) / "Library" / "bin" / "cmake.exe",
+                    Path(conda_prefix) / "Scripts" / "cmake.exe",
+                )
+                for path in windows_candidates:
+                    if path.is_file():
+                        return str(path.resolve())
             site_packages = (
                 Path(conda_prefix)
                 / "lib"

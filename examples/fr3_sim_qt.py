@@ -15,9 +15,24 @@ import numpy as np
 import fr3_control_sim as fr3
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DESCRIPTION_ROOT = Path(
-    os.environ.get("FRANKA_DESCRIPTION_ROOT", "/home/xense/fastiter/franka_description")
-)
+
+
+def _default_description_root() -> Path:
+    override = os.environ.get("FRANKA_DESCRIPTION_ROOT")
+    if override:
+        return Path(override)
+    candidates = (
+        PROJECT_ROOT / "third_party" / "franka_description",
+        PROJECT_ROOT / "franka_description",
+        Path("/home/xense/fastiter/franka_description"),
+    )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return candidates[0]
+
+
+DEFAULT_DESCRIPTION_ROOT = _default_description_root()
 
 try:
     from PySide6.QtCore import QSignalBlocker, Qt, QTimer, QUrl, Signal
