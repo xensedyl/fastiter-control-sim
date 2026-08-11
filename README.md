@@ -13,11 +13,7 @@
 models/fr3_franka_hand.urdf
 ```
 
-它由官方文件生成：
-
-```text
-/home/xense/fastiter/franka_description/robots/fr3/fr3.urdf.xacro
-```
+它由官方文件生成：[franka-research3.urdf.xacro](https://github.com/frankarobotics/franka_description/blob/main/robots/fr3/fr3.urdf.xacro)
 
 ## 工程结构
 
@@ -48,14 +44,24 @@ pip：自动运行 CMake，编译并安装 fr3-control-sim
 在工程根目录执行：
 
 ```bash
+git clone https://github.com/xensedyl/fastiter-control-sim.git
+```
+
+or
+
+```bash
+git clone git@github.com:xensedyl/fastiter-control-sim.git
+```
+
+```bash
 cd fastiter-control-sim
 
 mamba env create -f environment.yml
 mamba activate fr3sim
-python -m pip install -e .
+pip install -e .
 ```
 
-`environment.yml` 已包含全部 mamba 依赖，因此不需要再单独执行 `mamba install`。
+`environment.yml` 已包含全部 mamba 依赖，因此不需要再单独执行 `mamba install`。它还会在激活环境时清除继承自系统 ROS 的 `PYTHONPATH` 和 `AMENT_PREFIX_PATH`，防止 pip 错把 `/opt/ros` 中属于另一个 Python 版本的包当成当前环境的包。
 
 如果 `fr3sim` 已经存在，可以更新环境：
 
@@ -63,7 +69,7 @@ python -m pip install -e .
 mamba env update -n fr3sim -f environment.yml
 mamba deactivate
 mamba activate fr3sim
-python -m pip install -e .
+pip install -e .
 ```
 
 ### 方案二：手动创建环境
@@ -71,34 +77,55 @@ python -m pip install -e .
 下面的命令与 `environment.yml` 等价：
 
 ```bash
-cd /home/xense/fastiter/fastiter-control-sim
+git clone https://github.com/xensedyl/fastiter-control-sim.git
+```
 
-# 1. 创建基础环境
+or
+
+```bash
+git clone git@github.com:xensedyl/fastiter-control-sim.git
+```
+
+1. 创建基础环境
+```bash
+cd fastiter-control-sim
 mamba create -n fr3sim -c conda-forge python=3.12
+```
 
-# 2. 安装 C++ 工具链和第三方库
+2. 安装 C++ 工具链和第三方库
+```bash
 mamba install -n fr3sim -c conda-forge \
   numpy pinocchio=3.9 pybind11 cmake pkg-config \
   cxx-compiler make eigen urdfdom console_bridge tinyxml2 \
   pip setuptools wheel
+```
 
-# 3. 激活环境
+3. 激活环境
+```bash
 mamba activate fr3sim
+```
 
-# 4. 自动运行 CMake、编译 C++ 并 editable 安装
-python -m pip install -e .
+4. 隔离系统中可能已经 source 的 ROS Python 路径
+```bash
+unset PYTHONPATH AMENT_PREFIX_PATH
+export PYTHONNOUSERSITE=1
+```
+
+5. 自动运行 CMake、编译 C++ 并 editable 安装
+```bash
+pip install -e .
 ```
 
 需要查看完整 CMake 编译输出时使用：
 
 ```bash
-python -m pip install -v -e .
+pip install -v -e .
 ```
 
 如果不能访问 PyPI，但 mamba 环境中已经安装了 setuptools、wheel 和 pybind11，可以关闭 pip 构建隔离：
 
 ```bash
-python -m pip install -v -e . --no-build-isolation
+pip install -v -e . --no-build-isolation
 ```
 
 ## editable 安装说明
@@ -113,13 +140,13 @@ python -m pip install -v -e . --no-build-isolation
 修改 Python 文件后会立即生效。修改 C++ 文件后，需要重新编译：
 
 ```bash
-python -m pip install -e .
+pip install -e .
 ```
 
 非 editable 安装使用：
 
 ```bash
-python -m pip install .
+pip install .
 ```
 
 ## 安装验证
@@ -237,20 +264,76 @@ cmake --build build --parallel "$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-## 重新生成官方 URDF
+## xacro 转换为 URDF
 
-工程已包含可用 URDF，通常不需要重新生成。官方描述更新后可执行：
+工程已经包含可用的 `models/fr3_franka_hand.urdf`。安装、编译和运行仿真都不需要 ROS，通常也不需要重新生成 URDF。`scripts/generate_official_urdf.sh` 是一个通用的 xacro 到 URDF 转换脚本。
+
+### 安装 xacro
+
+本工程不依赖 ROS。`xacro==2.1.1` 和 `PyYAML>=6.0` 已写入 `pyproject.toml`，因此 `python -m pip install -e .` 会把它们安装到当前 mamba 环境：
 
 ```bash
-python /opt/ros/humble/bin/xacro \
-  -o models/fr3_franka_hand.urdf \
-  /home/xense/fastiter/franka_description/robots/fr3/fr3.urdf.xacro \
-  hand:=true ee_id:=franka_hand with_sc:=false
-
-check_urdf models/fr3_franka_hand.urdf
+pip install -e .
 ```
 
-最初使用的 `/home/xense/fastiter/franka_description_URDF/urdfs/fr3_franka_hand.urdf` 存在手爪父链接命名问题，因此本工程使用官方 `franka_description` 生成的模型。
+如果当前 shell 曾经执行过 ROS 的 `setup.bash`，ROS 的 `PYTHONPATH` 可能让 pip 错以为 `xacro` 已经安装。通过本工程最新的 `environment.yml` 创建或更新环境后，重新激活即可自动隔离这些路径：
+
+```bash
+mamba env update -n fr3sim -f environment.yml
+mamba deactivate
+mamba activate fr3sim
+pip install -e .
+```
+
+如果只想单独安装生成工具：
+
+```bash
+PYTHONNOUSERSITE=1 PYTHONPATH= AMENT_PREFIX_PATH= \
+  python -m pip install "xacro==2.1.1" "PyYAML>=6.0"
+```
+
+安装后检查当前 Python 能否导入：
+
+```bash
+command -v python
+PYTHONNOUSERSITE=1 PYTHONPATH= AMENT_PREFIX_PATH= \
+  python -c "import xacro, yaml; print(xacro.__file__); print(yaml.__version__)"
+```
+
+脚本的第一个参数是 xacro 文件的绝对路径，第二个参数是输出 URDF。使用官方 FR3 xacro 重新生成模型：
+
+```bash
+./scripts/generate_official_urdf.sh \
+  /home/xense/fastiter/franka_description/robots/fr3/fr3.urdf.xacro \
+  models/fr3_franka_hand.urdf
+```
+
+脚本只接收这两个参数，不接收或修改 xacro 内部参数。输入 xacro 将使用它自身声明的默认值；需要不同配置时，直接修改或准备对应的 xacro 文件，再指定新的输出 URDF 文件名。
+
+脚本支持普通 xacro、相对路径 include，以及 xacro 所在软件包自身的 `$(find package_name)`。它会从输入文件向上查找最近的 `package.xml` 并建立本地软件包映射，因此不需要 ROS，也不需要 `ament-index-python`，原始 xacro 文件不会被修改。
+
+如果 xacro 还引用了其他软件包，把这些软件包的根目录或它们共同的父目录放入 `XACRO_PACKAGE_PATH`：
+
+```bash
+XACRO_PACKAGE_PATH=/absolute/path/to/workspace/src \
+  ./scripts/generate_official_urdf.sh \
+    /absolute/path/to/robot_description/urdf/robot.urdf.xacro \
+    models/robot.urdf
+```
+
+因此，它可以转换任何语法有效、并且所有 include、YAML 和软件包依赖都能在本地解析的 xacro。
+
+转换会先写入输出目录中的临时文件，只有 xacro 展开、XML `<robot>` 根节点检查以及可选的 `check_urdf` 全部成功后，才会替换目标 URDF。转换失败不会破坏已有的输出文件。
+
+脚本只使用当前激活 mamba 环境中的 Python：
+
+```bash
+python -c 'import xacro; xacro.main()'
+```
+
+脚本不会查找任何外部 xacro 可执行文件，只会从当前 Python 环境导入 xacro。运行时会清除外部 `PYTHONPATH` 和 `AMENT_PREFIX_PATH`，避免意外加载 ROS 中的 Python 包。如果导入失败，脚本会提示先执行 `python -m pip install -e .`。
+
+`check_urdf` 只用于生成后的额外校验；没有该命令时仍会检查 XML 格式和 `<robot>` 根节点。
 
 ## 常见问题
 
@@ -271,6 +354,26 @@ mamba install -n fr3sim -c conda-forge \
 
 ```bash
 mamba list -n fr3sim | grep -E "pinocchio|tinyxml2|urdfdom|console_bridge"
+```
+
+### 生成 URDF 时提示无法导入 xacro
+
+这通常不是依赖没有声明，而是当前 shell 的 ROS `PYTHONPATH` 让 pip 看到了 `/opt/ros` 中的 xacro，却没有把它安装到 `fr3sim`。更新并重新激活环境后重装：
+
+```bash
+mamba env update -n fr3sim -f environment.yml
+mamba deactivate
+mamba activate fr3sim
+python -m pip install -e .
+python -c "import xacro, yaml; print(xacro.__file__); print(yaml.__file__)"
+```
+
+然后使用正确的 `.urdf` 后缀生成：
+
+```bash
+./scripts/generate_official_urdf.sh \
+  /home/xense/fastiter/franka_description/robots/fr3/fr3.urdf.xacro \
+  models/fr3_franka_hand.urdf
 ```
 
 ### pip 为什么不能单独安装所有依赖
