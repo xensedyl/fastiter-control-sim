@@ -20,6 +20,8 @@
 namespace fr3_control_sim {
 namespace {
 
+constexpr double kPi = 3.141592653589793238462643383279502884;
+
 bool is_finite_matrix(const Eigen::Matrix4d &matrix) {
   return matrix.array().isFinite().all();
 }
@@ -122,7 +124,7 @@ std::vector<std::string> RobotModel::frame_names() const {
 
 Eigen::VectorXd RobotModel::home_configuration() const {
   Eigen::VectorXd q(7);
-  q << 0.0, -M_PI / 4.0, 0.0, -3.0 * M_PI / 4.0, 0.0, M_PI / 2.0, M_PI / 4.0;
+  q << 0.0, -kPi / 4.0, 0.0, -3.0 * kPi / 4.0, 0.0, kPi / 2.0, kPi / 4.0;
   return clamp_configuration(q);
 }
 
@@ -133,10 +135,10 @@ Eigen::VectorXd RobotModel::random_configuration(unsigned int seed) const {
     double lower = model_.lowerPositionLimit[index];
     double upper = model_.upperPositionLimit[index];
     if (!std::isfinite(lower)) {
-      lower = -M_PI;
+      lower = -kPi;
     }
     if (!std::isfinite(upper)) {
-      upper = M_PI;
+      upper = kPi;
     }
     std::uniform_real_distribution<double> distribution(lower, upper);
     q[index] = distribution(generator);
