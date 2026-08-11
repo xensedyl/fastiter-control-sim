@@ -1,308 +1,252 @@
 # FR3 Pinocchio C++ 仿真
 
-本工程使用 Franka 官方 `franka_description` 模型，实现 FR3 的正运动学、雅可比、逆运动学和最小加加速度关节轨迹。
+本项目使用 Franka 官方 `franka_description` 模型，实现 FR3 机械臂的：
 
-- Pinocchio 计算、IK 和轨迹生成全部在 C++ 中完成。
-- Python 只通过 pybind11 调用 C++，并负责命令行和 MeshCat 显示。
-- 机械臂对外为 7 自由度，末端坐标系为 `fr3_hand_tcp`。
-- `pip install -e .` 会自动调用 CMake 编译 C++ 扩展，不需要 `build.sh` 或 `run_sim.sh`。
+- C++ 正运动学、雅可比、逆运动学和最小加加速度关节轨迹
+- Python/pybind11 调用接口
+- MeshCat 三维可视化
+- Qt FK/IK 滑条控制面板
+- xacro 转换、Python smoke test 和可选 C++ 测试
 
-默认 URDF 为：
+项目对 Linux 和原生 Windows 都提供完整功能。Windows 使用 Visual Studio/MSVC
+和 conda-forge 的 Pinocchio，不需要 ROS、WSL 或 MSYS2。
 
-```text
-models/fr3_franka_hand.urdf
+默认 URDF 为 `models/fr3_franka_hand.urdf`，末端坐标系为 `fr3_hand_tcp`。
+
+## 快速验证
+
+激活对应环境后执行：
+
+```bash
+python tests/smoke_test.py
+python examples/fr3_sim.py --headless --mode demo
 ```
 
-它由官方文件生成：[franka-research3.urdf.xacro](https://github.com/frankarobotics/franka_description/blob/main/robots/fr3/fr3.urdf.xacro)
+`--headless` 不需要三维网格资源。需要 MeshCat 或 Qt 时，先按下文准备
+`franka_description`。
 
 ## 工程结构
 
 ```text
-environment.yml                          mamba 环境定义
+environment.yml                          Linux/macOS Conda 环境
+environment-windows.yml                  原生 Windows Conda 环境
 CMakeLists.txt                           C++/pybind11 构建配置
-cpp/include/fr3_control_sim/robot_model.hpp
+cpp/include/fr3_control_sim/             C++ 公共头文件
 cpp/src/robot_model.cpp                  Pinocchio FK/IK/轨迹实现
 cpp/src/bindings.cpp                     pybind11 绑定
 python/fr3_control_sim/                  Python 包和 MeshCat 显示
-examples/fr3_sim.py                      仿真入口
+examples/fr3_sim.py                      命令行 FK/IK/demo 入口
 examples/fr3_sim_qt.py                   Qt FK/IK 滑条控制界面
-models/fr3_franka_hand.urdf              FR3 + Franka Hand 模型
-cpp/tests/test_kinematics.cpp            C++ 测试
-tests/smoke_test.py                      Python/pybind 测试
+models/fr3_franka_hand.urdf              已生成的 FR3 + Franka Hand URDF
+scripts/generate_official_urdf.sh        Linux/macOS xacro 转换脚本
+scripts/generate_official_urdf.ps1       Windows PowerShell xacro 转换脚本
+tests/smoke_test.py                      Python/pybind 回归测试
+cpp/tests/test_kinematics.cpp            C++ 回归测试
 ```
 
-## 安装
+## 官方模型和网格资源
 
-原生 C++ 依赖由 mamba 安装，当前工程由 pip 编译和安装。
+仓库跟踪生成后的 URDF，但不跟踪官方仓库中的大型 DAE 网格文件。这样可以保持
+代码仓库轻量，同时仍然兼容官方模型。准备可视化资源：
 
-```text
-mamba：Pinocchio、编译器、Eigen、urdfdom、tinyxml2 等
-pip：自动运行 CMake，编译并安装 fr3-control-sim
+```bash
+git clone --depth 1 https://github.com/frankarobotics/franka_description.git \
+  third_party/franka_description
 ```
 
-### 方案一：使用 environment.yml（推荐）
+Windows PowerShell 写法：
 
-在工程根目录执行：
+```powershell
+git clone --depth 1 https://github.com/frankarobotics/franka_description.git `
+  third_party\franka_description
+```
+
+两个示例会自动搜索以下目录：
+
+1. `FRANKA_DESCRIPTION_ROOT` 环境变量指定的目录
+2. 项目内 `third_party/franka_description`
+3. 项目根目录下的 `franka_description`
+4. Linux 兼容路径 `/home/xense/fastiter/franka_description`
+
+已有其他副本时，可以设置：
+
+```powershell
+$env:FRANKA_DESCRIPTION_ROOT = "D:\path\to\franka_description"
+```
+
+## Linux/macOS 安装
+
+需要 Conda 或 Mamba。推荐使用项目环境文件：
 
 ```bash
 git clone https://github.com/xensedyl/fastiter-control-sim.git
-```
-
-or
-
-```bash
-git clone git@github.com:xensedyl/fastiter-control-sim.git
-```
-
-```bash
 cd fastiter-control-sim
-
 mamba env create -f environment.yml
 mamba activate fr3sim
-pip install -e .
+python -m pip install -e .
 ```
 
-`environment.yml` 已包含全部 mamba 依赖，因此不需要再单独执行 `mamba install`。它还会在激活环境时清除继承自系统 ROS 的 `PYTHONPATH` 和 `AMENT_PREFIX_PATH`，防止 pip 错把 `/opt/ros` 中属于另一个 Python 版本的包当成当前环境的包。
-
-如果 `fr3sim` 已经存在，可以更新环境：
+`environment.yml` 会安装 Pinocchio、Eigen、urdfdom、tinyxml2、编译器和 Python
+依赖，并清空继承自 ROS 的 `PYTHONPATH` 和 `AMENT_PREFIX_PATH`。已有环境可更新：
 
 ```bash
 mamba env update -n fr3sim -f environment.yml
 mamba deactivate
 mamba activate fr3sim
-pip install -e .
+python -m pip install -e .
 ```
 
-### 方案二：手动创建环境
-
-下面的命令与 `environment.yml` 等价：
+如果需要完整构建日志：
 
 ```bash
-git clone https://github.com/xensedyl/fastiter-control-sim.git
+python -m pip install -v -e .
 ```
 
-or
+## 原生 Windows 安装
 
-```bash
-git clone git@github.com:xensedyl/fastiter-control-sim.git
+下面的流程已在 Windows 11、Python 3.11、Visual Studio Build Tools 2022、
+Pinocchio 4.x 环境中验证。
+
+### 1. 安装 MSVC 和 Windows SDK
+
+安装 Visual Studio Build Tools 2022 的 **Desktop development with C++** 工作负载，
+必须包含 MSVC 编译器、Windows SDK 和 CMake 集成。管理员 PowerShell 可执行：
+
+```powershell
+winget install --id Microsoft.VisualStudio.2022.BuildTools --exact `
+  --accept-package-agreements --accept-source-agreements --silent `
+  --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 ```
 
-1. 创建基础环境
-```bash
-cd fastiter-control-sim
-mamba create -n fr3sim -c conda-forge python=3.12
+安装完成后重新打开 PowerShell。普通 PowerShell 可以构建；也可以在
+“x64 Native Tools Command Prompt for VS 2022” 中执行后续命令。
+
+### 2. 创建 Conda 环境
+
+只使用 conda-forge，避免本机 `defaults` 源带来的 ABI 冲突：
+
+```powershell
+conda env create --override-channels -f environment-windows.yml
+conda activate fr3sim-win
 ```
 
-2. 安装 C++ 工具链和第三方库
-```bash
-mamba install -n fr3sim -c conda-forge \
-  numpy pyside6 pinocchio=3.9 pybind11 cmake pkg-config \
-  cxx-compiler make eigen urdfdom console_bridge tinyxml2 \
-  pip setuptools wheel
+安装 Windows 端的 Python 工具和 UI 依赖：
+
+```powershell
+python -m pip install cmake pybind11 meshcat "xacro==2.1.1" "PyYAML>=6.0" "PySide6>=6.6,<7"
 ```
 
-3. 激活环境
-```bash
-mamba activate fr3sim
+### 3. 获取可视化网格
+
+无头模式可以跳过此步；MeshCat 和 Qt 必须执行：
+
+```powershell
+git clone --depth 1 https://github.com/frankarobotics/franka_description.git `
+  third_party\franka_description
 ```
 
-4. 隔离系统中可能已经 source 的 ROS Python 路径
-```bash
-unset PYTHONPATH AMENT_PREFIX_PATH
-export PYTHONNOUSERSITE=1
+### 4. 编译并安装
+
+```powershell
+python -m pip install -e . --no-deps --no-build-isolation
 ```
 
-5. 自动运行 CMake、编译 C++ 并 editable 安装
-```bash
-pip install -e .
-```
+Windows 推荐这两个 pip 选项：依赖已经由 Conda/pip 明确安装，并确保 setuptools
+使用当前环境中的 MSVC、CMake、Pinocchio 和 pybind11。修改 C++ 后重复此命令；
+只修改 Python 文件无需重装。
 
-需要查看完整 CMake 编译输出时使用：
+### 5. 验证
 
-```bash
-pip install -v -e .
-```
-
-如果不能访问 PyPI，但 mamba 环境中已经安装了 setuptools、wheel 和 pybind11，可以关闭 pip 构建隔离：
-
-```bash
-pip install -v -e . --no-build-isolation
-```
-
-## editable 安装说明
-
-`pip install -e .` 会执行以下操作：
-
-1. setuptools 调用工程的 CMake 配置。
-2. CMake 使用当前 mamba 环境中的 Python、Pinocchio 和编译器。
-3. 编译 C++ 核心和 `_fr3_sim` pybind11 模块。
-4. 将 `python/fr3_control_sim` 作为 editable Python 包安装。
-
-修改 Python 文件后会立即生效。修改 C++ 文件后，需要重新编译：
-
-```bash
-pip install -e .
-```
-
-非 editable 安装使用：
-
-```bash
-pip install .
-```
-
-## 安装验证
-
-```bash
+```powershell
 python --version
-PKG_CONFIG_PATH="$CONDA_PREFIX/lib/pkgconfig" \
-  pkg-config --modversion pinocchio
-PKG_CONFIG_PATH="$CONDA_PREFIX/lib/pkgconfig" \
-  pkg-config --variable=prefix pinocchio
-python tests/smoke_test.py
+python -c "import pinocchio; print('Pinocchio:', pinocchio.__version__)"
 python -c "import fr3_control_sim; print(fr3_control_sim.__file__)"
-python -c "import fr3_control_sim._fr3_sim as m; print(m.__file__)"
+python tests\smoke_test.py
+python examples\fr3_sim.py --headless --mode demo
+python examples\fr3_sim_qt.py --help
 ```
 
-正常情况下应看到：
+### 6. 启动可视化
 
-- Python 为当前 `fr3sim` 环境中的解释器。
-- Pinocchio 版本为 `3.9.0`。
-- Pinocchio prefix 为 `$CONDA_PREFIX`，而不是 `/usr/local`。
-- Python 3.12 对应的扩展名为 `_fr3_sim.cpython-312-*.so`。
-
-检查动态库是否缺失：
-
-```bash
-ldd "$(python -c 'import fr3_control_sim._fr3_sim as m; print(m.__file__)')" \
-  | grep "not found"
+```powershell
+python examples\fr3_sim.py --mode demo
+python examples\fr3_sim_qt.py
 ```
 
-没有输出表示依赖完整。
+不自动打开浏览器时：
+
+```powershell
+python examples\fr3_sim.py --mode demo --no-open-browser
+python examples\fr3_sim_qt.py --no-open-browser
+```
+
+### Windows 与 Linux 的差异
+
+- 编译器：Windows 使用 Visual Studio/MSVC；Linux 使用 conda-forge `cxx-compiler`。
+- 环境文件：Windows 使用 `environment-windows.yml`；Linux 使用 `environment.yml`。
+- 构建：Windows 推荐 `--no-deps --no-build-isolation`；Linux 可直接 `pip install -e .`。
+- xacro：Windows 使用 PowerShell 脚本；Linux/macOS 使用 Bash 脚本。
+- 网格：两端的 MeshCat/Qt 都需要 `franka_description`；无头模式不需要。
 
 ## 运行仿真
 
-### Headless 测试
+### Headless demo
 
 ```bash
-mamba activate fr3sim
 python examples/fr3_sim.py --headless --mode demo
 ```
 
-### MeshCat 仿真
+### MeshCat demo
 
 ```bash
 python examples/fr3_sim.py --mode demo
-```
-
-浏览器会自动打开 MeshCat。若只想启动服务并手动打开终端中的 URL：
-
-```bash
 python examples/fr3_sim.py --mode demo --no-open-browser
 ```
 
-### 交互式 FK
+### FK
 
-不提供 `--q` 时，会持续在终端等待输入。关节角单位为度，输入 `q`、`quit`、`exit` 或空行退出：
+交互模式会持续等待关节角输入，单位为度；输入 `q`、`quit`、`exit` 或空行退出：
 
 ```bash
 python examples/fr3_sim.py --mode fk
 ```
 
-终端输入示例：
-
-```text
-joint angles > 0 -45 0 -135 0 90 45
-  ee position: [0.30689 0.      0.48688] m
-  ee rpy:      [-180.    0.    0.] deg
-```
-
-每次输入都会调用 C++ 正运动学，并立即刷新 MeshCat。
-
-### 单次 FK
-
-输入 7 个关节角，单位为度：
+单次 FK：
 
 ```bash
-python examples/fr3_sim.py --mode fk \
-  --q 0 -45 0 -135 0 90 45
+python examples/fr3_sim.py --mode fk --q 0 -45 0 -135 0 90 45
 ```
 
-### 交互式 IK
+### IK
 
-不提供 `--target` 时，会持续在终端等待目标位姿：
+交互模式：
 
 ```bash
 python examples/fr3_sim.py --mode ik
 ```
 
-终端支持两种输入格式：
-
-```text
-target pose [...] > 0.35 0.10 0.45
-target pose [...] > 0.35 0.10 0.45 3.1415926 0.0 0.2
-```
-
-- 前 3 个值是 `x y z`，单位为米；只输入 3 个值时保持当前末端方向。
-- 后 3 个值是 `roll pitch yaw`，单位为弧度。
-- 每次 IK 都以上一次成功结果为初值。
-- IK 成功后，C++ 生成 50 Hz 最小加加速度轨迹，MeshCat 播放后继续等待下一次输入。
-- 输入 `q`、`quit`、`exit` 或空行退出。
-
-### 单次 IK
-
-目标位置格式为 `x y z`，单位为米：
+单次 IK 的目标可以是 `x y z`，也可以是 `x y z roll pitch yaw`；位置单位为米，
+RPY 单位为弧度：
 
 ```bash
-python examples/fr3_sim.py --mode ik \
-  --target 0.35 0.10 0.45
+python examples/fr3_sim.py --mode ik --target 0.35 0.10 0.45
+python examples/fr3_sim.py --mode ik --target 0.35 0.10 0.45 3.1415926 0.0 0.2
 ```
 
-完整目标位姿格式为 `x y z roll pitch yaw`，位置单位为米，RPY 单位为弧度：
+IK 成功后，C++ 生成 50 Hz 的最小加加速度关节轨迹并由 MeshCat 播放。
 
-```bash
-python examples/fr3_sim.py --mode ik \
-  --target 0.35 0.10 0.45 3.1415926 0.0 0.2
-```
-
-IK 成功后，C++ 会生成 50 Hz 最小加加速度关节轨迹，并由 MeshCat 播放。
-
-### Qt 滑条控制
-
-启动 Qt 控制面板和 MeshCat：
+### Qt 控制面板
 
 ```bash
 python examples/fr3_sim_qt.py
-```
-
-窗口包含两个页签：
-
-- `FK - Joint sliders`：拖动 `joint1` 到 `joint7`，单位为度；范围直接来自 C++ 模型中的关节限位。
-- `IK - XYZ / RPY sliders`：拖动 `x/y/z`（米）和 `roll/pitch/yaw`（弧度），停止拖动约 80 ms 后调用 C++ IK。
-
-IK 页签以上一次成功解作为下一次求解初值。不可达目标会显示红色错误信息，并保持机器人上一次成功姿态不变。
-
-默认打开 FK 页签；直接打开 IK 页签：
-
-```bash
 python examples/fr3_sim_qt.py --mode ik
-```
-
-只运行 Qt 控制面板、不启动 MeshCat：
-
-```bash
 python examples/fr3_sim_qt.py --no-meshcat
 ```
 
-如果现有 `fr3sim` 环境还没有 Qt，更新环境后重新激活：
+FK 页签控制 7 个关节角；IK 页签控制 XYZ/RPY。不可达目标会显示错误，并保留上次
+成功姿态。
 
-```bash
-mamba env update -n fr3sim -f environment.yml
-mamba deactivate
-mamba activate fr3sim
-pip install -e .
-```
-
-## Python 接口示例
+## Python 接口
 
 ```python
 import numpy as np
@@ -310,10 +254,6 @@ from fr3_control_sim import IKOptions, RobotModel, pose_from_xyz_rpy
 
 model = RobotModel("models/fr3_franka_hand.urdf")
 q0 = model.home_configuration()
-
-T = model.forward_kinematics(q0)
-J = model.jacobian(q0)
-
 target = pose_from_xyz_rpy(
     np.array([0.35, 0.10, 0.45]),
     np.array([3.1415926, 0.0, 0.2]),
@@ -322,140 +262,82 @@ result = model.inverse_kinematics(target, q0, IKOptions())
 trajectory = model.minimum_jerk_trajectory(q0, result.q, 2.0, 0.02)
 ```
 
-## 可选：手动运行 C++ 测试
-
-正常安装不需要手动执行 CMake。需要单独运行 CTest 时：
-
-```bash
-cmake -S . -B build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" \
-  -DPython3_EXECUTABLE="$CONDA_PREFIX/bin/python" \
-  -DPython3_FIND_VIRTUALENV=ONLY \
-  -DPKG_CONFIG_USE_CMAKE_PREFIX_PATH=ON \
-  -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
-  -DFR3_SIM_BUILD_TESTS=ON
-
-cmake --build build --parallel "$(nproc)"
-ctest --test-dir build --output-on-failure
-```
-
 ## xacro 转换为 URDF
 
-工程已经包含可用的 `models/fr3_franka_hand.urdf`。安装、编译和运行仿真都不需要 ROS，通常也不需要重新生成 URDF。`scripts/generate_official_urdf.sh` 是一个通用的 xacro 到 URDF 转换脚本。
+项目已经包含可用的 `models/fr3_franka_hand.urdf`，正常安装和运行不需要重新生成。
+若需要从官方 xacro 重新生成：
 
-### 安装 xacro
-
-本工程不依赖 ROS。`xacro==2.1.1` 和 `PyYAML>=6.0` 已写入 `pyproject.toml`，因此 `python -m pip install -e .` 会把它们安装到当前 mamba 环境：
-
-```bash
-pip install -e .
-```
-
-如果当前 shell 曾经执行过 ROS 的 `setup.bash`，ROS 的 `PYTHONPATH` 可能让 pip 错以为 `xacro` 已经安装。通过本工程最新的 `environment.yml` 创建或更新环境后，重新激活即可自动隔离这些路径：
-
-```bash
-mamba env update -n fr3sim -f environment.yml
-mamba deactivate
-mamba activate fr3sim
-pip install -e .
-```
-
-如果只想单独安装生成工具：
-
-```bash
-PYTHONNOUSERSITE=1 PYTHONPATH= AMENT_PREFIX_PATH= \
-  python -m pip install "xacro==2.1.1" "PyYAML>=6.0"
-```
-
-安装后检查当前 Python 能否导入：
-
-```bash
-command -v python
-PYTHONNOUSERSITE=1 PYTHONPATH= AMENT_PREFIX_PATH= \
-  python -c "import xacro, yaml; print(xacro.__file__); print(yaml.__version__)"
-```
-
-脚本的第一个参数是 xacro 文件的绝对路径，第二个参数是输出 URDF。使用官方 FR3 xacro 重新生成模型：
+Linux/macOS：
 
 ```bash
 ./scripts/generate_official_urdf.sh \
-  /home/xense/fastiter/franka_description/robots/fr3/fr3.urdf.xacro \
+  /absolute/path/to/franka_description/robots/fr3/fr3.urdf.xacro \
   models/fr3_franka_hand.urdf
 ```
 
-脚本只接收这两个参数，不接收或修改 xacro 内部参数。输入 xacro 将使用它自身声明的默认值；需要不同配置时，直接修改或准备对应的 xacro 文件，再指定新的输出 URDF 文件名。
+Windows PowerShell（两个路径都必须是绝对路径）：
 
-脚本支持普通 xacro、相对路径 include，以及 xacro 所在软件包自身的 `$(find package_name)`。它会从输入文件向上查找最近的 `package.xml` 并建立本地软件包映射，因此不需要 ROS，也不需要 `ament-index-python`，原始 xacro 文件不会被修改。
-
-如果 xacro 还引用了其他软件包，把这些软件包的根目录或它们共同的父目录放入 `XACRO_PACKAGE_PATH`：
-
-```bash
-XACRO_PACKAGE_PATH=/absolute/path/to/workspace/src \
-  ./scripts/generate_official_urdf.sh \
-    /absolute/path/to/robot_description/urdf/robot.urdf.xacro \
-    models/robot.urdf
+```powershell
+& .\scripts\generate_official_urdf.ps1 `
+  "D:\path\to\franka_description\robots\fr3\fr3.urdf.xacro" `
+  "D:\Projects\0-FastIter-Arm\simulation\models\fr3_franka_hand.urdf"
 ```
 
-因此，它可以转换任何语法有效、并且所有 include、YAML 和软件包依赖都能在本地解析的 xacro。
+如果 xacro 依赖其他软件包，将其根目录或共同父目录加入 `XACRO_PACKAGE_PATH`。
+脚本会在替换目标 URDF 前完成 XML 和 `<robot>` 根节点校验；可用时还会运行
+`check_urdf`。
 
-转换会先写入输出目录中的临时文件，只有 xacro 展开、XML `<robot>` 根节点检查以及可选的 `check_urdf` 全部成功后，才会替换目标 URDF。转换失败不会破坏已有的输出文件。
+## 测试与重新构建
 
-脚本只使用当前激活 mamba 环境中的 Python：
+Python smoke test：
 
 ```bash
-python -c 'import xacro; xacro.main()'
+python tests/smoke_test.py
 ```
 
-脚本不会查找任何外部 xacro 可执行文件，只会从当前 Python 环境导入 xacro。运行时会清除外部 `PYTHONPATH` 和 `AMENT_PREFIX_PATH`，避免意外加载 ROS 中的 Python 包。如果导入失败，脚本会提示先执行 `python -m pip install -e .`。
+修改 C++ 后重新构建：
 
-`check_urdf` 只用于生成后的额外校验；没有该命令时仍会检查 XML 格式和 `<robot>` 根节点。
+```bash
+python -m pip install -e .
+```
+
+Windows：
+
+```powershell
+python -m pip install -e . --no-deps --no-build-isolation
+```
 
 ## 常见问题
 
-### CMake 找到 Pinocchio 3.4.0
+### `cannot resolve package://franka_description/...`
 
-说明当前 mamba 环境没有安装 Pinocchio，pkg-config 回退到了 `/usr/local`。重新执行：
+这是可视化网格目录未准备好。执行上面的 `git clone`，或设置
+`FRANKA_DESCRIPTION_ROOT`。`--headless` 模式不需要网格。
 
-```bash
-mamba install -n fr3sim -c conda-forge \
-  numpy pyside6 pinocchio=3.9 pybind11 cmake pkg-config \
-  cxx-compiler make eigen urdfdom console_bridge tinyxml2 \
-  pip setuptools wheel
+### Windows 找不到 `cl.exe` 或 CMake 编译失败
+
+确认已安装 Visual Studio Build Tools 的 C++ 工作负载和 Windows SDK，重新打开
+PowerShell 后再执行安装命令。也可以从 “x64 Native Tools Command Prompt for VS 2022”
+运行 pip 构建。
+
+### `pip` 找到错误的 Python 或 ROS 包
+
+先确认：
+
+```powershell
+python -c "import sys; print(sys.executable)"
+python -c "import fr3_control_sim; print(fr3_control_sim.__file__)"
 ```
 
-### 找不到 tinyxml2
+Linux 环境若曾执行过 ROS `setup.bash`，重新激活 `fr3sim`，并确保
+`PYTHONPATH`、`AMENT_PREFIX_PATH` 没有指向其他 Python 环境。
 
-说明当前环境缺少原生 C++ 依赖。检查：
+### pip 为什么不能替代 Conda
 
-```bash
-mamba list -n fr3sim | grep -E "pinocchio|tinyxml2|urdfdom|console_bridge"
-```
-
-### 生成 URDF 时提示无法导入 xacro
-
-这通常不是依赖没有声明，而是当前 shell 的 ROS `PYTHONPATH` 让 pip 看到了 `/opt/ros` 中的 xacro，却没有把它安装到 `fr3sim`。更新并重新激活环境后重装：
-
-```bash
-mamba env update -n fr3sim -f environment.yml
-mamba deactivate
-mamba activate fr3sim
-python -m pip install -e .
-python -c "import xacro, yaml; print(xacro.__file__); print(yaml.__file__)"
-```
-
-然后使用正确的 `.urdf` 后缀生成：
-
-```bash
-./scripts/generate_official_urdf.sh \
-  /home/xense/fastiter/franka_description/robots/fr3/fr3.urdf.xacro \
-  models/fr3_franka_hand.urdf
-```
-
-### pip 为什么不能单独安装所有依赖
-
-pip 会安装 Python 包并编译当前工程，但不会管理 conda-forge 的 C++ 编译器、Pinocchio、urdfdom 和 tinyxml2。它们必须先通过 `environment.yml` 或 `mamba install` 安装。
+pip 负责 Python 包和当前项目的 C++ 扩展构建；Pinocchio、Eigen、urdfdom、tinyxml2
+等 ABI 敏感的 C++ 依赖必须由对应平台的 conda-forge 或 Visual Studio 工具链提供。
 
 ## 许可证
 
-本项目源代码采用 [MIT License](LICENSE)。由 Franka 官方 `franka_description` 生成的模型仍遵循其原始 Apache-2.0 许可证。
+本项目源代码采用 [MIT License](LICENSE)。由 Franka 官方 `franka_description` 生成的
+模型和网格仍遵循其原始 Apache-2.0 许可证。
