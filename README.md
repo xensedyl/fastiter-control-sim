@@ -25,6 +25,7 @@ cpp/src/robot_model.cpp                  Pinocchio FK/IK/轨迹实现
 cpp/src/bindings.cpp                     pybind11 绑定
 python/fr3_control_sim/                  Python 包和 MeshCat 显示
 examples/fr3_sim.py                      仿真入口
+examples/fr3_sim_qt.py                   Qt FK/IK 滑条控制界面
 models/fr3_franka_hand.urdf              FR3 + Franka Hand 模型
 cpp/tests/test_kinematics.cpp            C++ 测试
 tests/smoke_test.py                      Python/pybind 测试
@@ -95,7 +96,7 @@ mamba create -n fr3sim -c conda-forge python=3.12
 2. 安装 C++ 工具链和第三方库
 ```bash
 mamba install -n fr3sim -c conda-forge \
-  numpy pinocchio=3.9 pybind11 cmake pkg-config \
+  numpy pyside6 pinocchio=3.9 pybind11 cmake pkg-config \
   cxx-compiler make eigen urdfdom console_bridge tinyxml2 \
   pip setuptools wheel
 ```
@@ -199,7 +200,25 @@ python examples/fr3_sim.py --mode demo
 python examples/fr3_sim.py --mode demo --no-open-browser
 ```
 
-### FK
+### 交互式 FK
+
+不提供 `--q` 时，会持续在终端等待输入。关节角单位为度，输入 `q`、`quit`、`exit` 或空行退出：
+
+```bash
+python examples/fr3_sim.py --mode fk
+```
+
+终端输入示例：
+
+```text
+joint angles > 0 -45 0 -135 0 90 45
+  ee position: [0.30689 0.      0.48688] m
+  ee rpy:      [-180.    0.    0.] deg
+```
+
+每次输入都会调用 C++ 正运动学，并立即刷新 MeshCat。
+
+### 单次 FK
 
 输入 7 个关节角，单位为度：
 
@@ -208,7 +227,28 @@ python examples/fr3_sim.py --mode fk \
   --q 0 -45 0 -135 0 90 45
 ```
 
-### IK
+### 交互式 IK
+
+不提供 `--target` 时，会持续在终端等待目标位姿：
+
+```bash
+python examples/fr3_sim.py --mode ik
+```
+
+终端支持两种输入格式：
+
+```text
+target pose [...] > 0.35 0.10 0.45
+target pose [...] > 0.35 0.10 0.45 3.1415926 0.0 0.2
+```
+
+- 前 3 个值是 `x y z`，单位为米；只输入 3 个值时保持当前末端方向。
+- 后 3 个值是 `roll pitch yaw`，单位为弧度。
+- 每次 IK 都以上一次成功结果为初值。
+- IK 成功后，C++ 生成 50 Hz 最小加加速度轨迹，MeshCat 播放后继续等待下一次输入。
+- 输入 `q`、`quit`、`exit` 或空行退出。
+
+### 单次 IK
 
 目标位置格式为 `x y z`，单位为米：
 
@@ -225,6 +265,42 @@ python examples/fr3_sim.py --mode ik \
 ```
 
 IK 成功后，C++ 会生成 50 Hz 最小加加速度关节轨迹，并由 MeshCat 播放。
+
+### Qt 滑条控制
+
+启动 Qt 控制面板和 MeshCat：
+
+```bash
+python examples/fr3_sim_qt.py
+```
+
+窗口包含两个页签：
+
+- `FK - Joint sliders`：拖动 `joint1` 到 `joint7`，单位为度；范围直接来自 C++ 模型中的关节限位。
+- `IK - XYZ / RPY sliders`：拖动 `x/y/z`（米）和 `roll/pitch/yaw`（弧度），停止拖动约 80 ms 后调用 C++ IK。
+
+IK 页签以上一次成功解作为下一次求解初值。不可达目标会显示红色错误信息，并保持机器人上一次成功姿态不变。
+
+默认打开 FK 页签；直接打开 IK 页签：
+
+```bash
+python examples/fr3_sim_qt.py --mode ik
+```
+
+只运行 Qt 控制面板、不启动 MeshCat：
+
+```bash
+python examples/fr3_sim_qt.py --no-meshcat
+```
+
+如果现有 `fr3sim` 环境还没有 Qt，更新环境后重新激活：
+
+```bash
+mamba env update -n fr3sim -f environment.yml
+mamba deactivate
+mamba activate fr3sim
+pip install -e .
+```
 
 ## Python 接口示例
 
@@ -343,7 +419,7 @@ python -c 'import xacro; xacro.main()'
 
 ```bash
 mamba install -n fr3sim -c conda-forge \
-  numpy pinocchio=3.9 pybind11 cmake pkg-config \
+  numpy pyside6 pinocchio=3.9 pybind11 cmake pkg-config \
   cxx-compiler make eigen urdfdom console_bridge tinyxml2 \
   pip setuptools wheel
 ```
