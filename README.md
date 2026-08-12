@@ -26,6 +26,7 @@ cpp/src/bindings.cpp                     pybind11 绑定
 python/fr3_control_sim/                  Python 包和 MeshCat 显示
 examples/fr3_sim.py                      仿真入口
 examples/fr3_sim_qt.py                   Qt FK/IK 滑条控制界面
+examples/fr3_mink_ik.py                  Mink 风格 differential IK 示例
 models/fr3_franka_hand.urdf              FR3 + Franka Hand 模型
 cpp/tests/test_kinematics.cpp            C++ 测试
 tests/smoke_test.py                      Python/pybind 测试
@@ -178,6 +179,10 @@ ldd "$(python -c 'import fr3_control_sim._fr3_sim as m; print(m.__file__)')" \
 ```
 
 没有输出表示依赖完整。
+
+如果修改了 `cpp/` 中的 Mink differential IK 实现，editable 安装需要重新运行
+`pip install -e .` 让 CMake 重新编译扩展；只修改 `examples/` 或
+`python/fr3_control_sim/visualizer.py` 时不需要重新编译。
 
 ## 运行仿真
 
@@ -350,6 +355,69 @@ target = pose_from_xyz_rpy(
 result = model.inverse_kinematics(target, q0, IKOptions())
 trajectory = model.minimum_jerk_trajectory(q0, result.q, 2.0, 0.02)
 ```
+
+## Mink 风格 differential IK（`feat/mink`）
+
+`feat/mink` 保留原有的 `inverse_kinematics()`，另外增加了与
+`/home/xense/fastiter/mink` 思路对应的微分 IK 接口。两者的区别是：
+
+- `inverse_kinematics()` 是一次调用内部迭代到最终关节角的 Pinocchio DLS IK，返回 `q`。
+- `differential_ik_step()` 每次只解一个局部加权 QP，返回 `delta_q`、`velocity=delta_q/dt` 和 `next_q`；控制循环需要反复调用它。
+- C++ 端实现了 Mink 的 6D FrameTask、软 PostureTask、阻尼，以及 FR3 的线性化关节位置/速度盒约束。Python 只负责调用 pybind，不在 Python 中运行 FK、Jacobian 或 QP。
+- Mink 原版使用 MuJoCo MJCF 和 `qpsolvers`；本分支直接使用同一官方 FR3 URDF、Pinocchio 和 Eigen，因此不需要把 MuJoCo 或 Python `qpsolvers` 加入工程。
+- 当前迁移版针对 FR3 的 7 个转动关节；通用多任务、等式约束和碰撞约束需要后续接入原生 C++ QP 后端，尚未伪装成已支持的功能。
+
+### 单步调用
+
+```python
+import numpy as np
+from fr3_control_sim import DifferentialIKOptions, RobotModel
+
+model = RobotModel("models/fr3_franka_hand.urdf")
+q = np.asarray(model.home_configuration(), dtype=float)
+target = np.asarray(model.forward_kinematics(q), dtype=float)
+target[:3, 3] += [0.03, -0.04, 0.02]
+
+options = DifferentialIKOptions()
+options.dt = 0.02
+options.posture_cost = 1e-2       # Mink PostureTask 的软权重；0 表示关闭
+options.posture_gain = 1.0        # Mink task gain，范围 [0, 1]
+options.enforce_velocity_limits = True
+
+for _ in range(200):
+    step = model.differential_ik_step(q, target, options)
+    if not step.success:
+        raise RuntimeError(step.status)
+    q = np.asarray(step.next_q, dtype=float)
+    # step.velocity 是 rad/s；step.delta_q 是本周期的 rad 位移。
+```
+
+### 运行迁移示例
+
+```bash
+python examples/fr3_mink_ik.py
+```
+
+指定目标位姿（位置单位米，RPY 单位弧度）：
+
+```bash
+python examples/fr3_mink_ik.py \
+  --target 0.35 0.10 0.45 3.1415926 0.0 0.2 \
+  --posture-cost 0.01 \
+  --velocity-limits \
+  --steps 300
+```
+
+如果需要一次调用得到最终 `q`，可以使用 C++ 侧的 convenience wrapper：
+
+```python
+options = DifferentialIKOptions()
+options.posture_cost = 1e-2
+options.max_iterations = 300
+result = model.mink_inverse_kinematics(target, q, options)
+```
+
+`posture_cost` 与原有批量 IK 的 `IKOptions.posture_gain` 不是同一个参数：前者是 Mink 风格 QP 中的软任务权重，后者是现有批量求解器在末端收敛后使用的显式零空间步长。
 
 ## 可选：手动运行 C++ 测试
 

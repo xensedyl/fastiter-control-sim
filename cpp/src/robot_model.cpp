@@ -10,13 +10,16 @@
 #include <pinocchio/spatial/explog.hpp>
 
 #include <Eigen/QR>
+#include <Eigen/Cholesky>
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <limits>
 #include <random>
+#include <set>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace fr3_control_sim {
 namespace {
@@ -27,6 +30,240 @@ bool is_finite_matrix(const Eigen::Matrix4d &matrix) {
 
 bool has_joint(const pinocchio::Model &model, const std::string &name) {
   return model.existJointName(name);
+}
+
+pinocchio::SE3 target_from_matrix(const Eigen::Matrix4d &target_matrix) {
+  if (!is_finite_matrix(target_matrix)) {
+    throw std::invalid_argument("target contains NaN or infinity");
+  }
+  const Eigen::RowVector4d homogeneous_row(0.0, 0.0, 0.0, 1.0);
+  if (!target_matrix.row(3).isApprox(homogeneous_row, 1e-8)) {
+    throw std::invalid_argument("target last row must be [0, 0, 0, 1]");
+  }
+
+  const Eigen::Matrix3d rotation = target_matrix.topLeftCorner<3, 3>();
+  const double orthogonality_error =
+      (rotation.transpose() * rotation - Eigen::Matrix3d::Identity()).norm();
+  if (orthogonality_error > 1e-5 || rotation.determinant() <= 0.0) {
+    throw std::invalid_argument(
+        "target rotation must be a proper rotation matrix");
+  }
+  Eigen::Quaterniond quaternion(rotation);
+  if (quaternion.norm() < std::numeric_limits<double>::epsilon()) {
+    throw std::invalid_argument("target rotation is singular");
+  }
+  quaternion.normalize();
+  return pinocchio::SE3(quaternion.toRotationMatrix(),
+                        target_matrix.topRightCorner<3, 1>());
+}
+
+struct BoxQPResult {
+  Eigen::VectorXd x;
+  bool success = false;
+  int active_lower = 0;
+  int active_upper = 0;
+  std::string status;
+};
+
+Eigen::VectorXd solve_symmetric_system(const Eigen::MatrixXd &matrix,
+                                       const Eigen::VectorXd &rhs) {
+  const auto acceptable = [&](const Eigen::VectorXd &result) {
+    if (!result.array().isFinite().all()) {
+      return false;
+    }
+    const double scale = std::max(
+        1.0, std::max(rhs.norm(), matrix.norm() * result.norm()));
+    return (matrix * result - rhs).norm() <= 1e-8 * scale;
+  };
+
+  Eigen::LDLT<Eigen::MatrixXd> ldlt(matrix);
+  if (ldlt.info() == Eigen::Success) {
+    const Eigen::VectorXd result = ldlt.solve(rhs);
+    if (acceptable(result)) {
+      return result;
+    }
+  }
+
+  Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> decomposition(matrix);
+  const Eigen::VectorXd result = decomposition.solve(rhs);
+  if (!acceptable(result)) {
+    throw std::runtime_error("differential IK QP linear system is singular");
+  }
+  return result;
+}
+
+// Solve the small bound-constrained convex QP used by the FR3 port.  Mink
+// represents configuration and velocity limits as linear inequalities.  For
+// the reduced FR3 model all tangent coordinates are revolute joint angles, so
+// their intersection is a box.  This dense working-set solver avoids adding a
+// Python QP dependency and gives the same KKT solution for these bounds.
+BoxQPResult solve_box_qp(const Eigen::MatrixXd &input_hessian,
+                         const Eigen::VectorXd &linear,
+                         const Eigen::VectorXd &lower,
+                         const Eigen::VectorXd &upper,
+                         int max_iterations, double tolerance) {
+  const int dimension = static_cast<int>(linear.size());
+  if (input_hessian.rows() != dimension || input_hessian.cols() != dimension ||
+      lower.size() != dimension || upper.size() != dimension) {
+    throw std::invalid_argument("differential IK QP dimensions do not match");
+  }
+  for (int index = 0; index < dimension; ++index) {
+    if (std::isfinite(lower[index]) && std::isfinite(upper[index]) &&
+        lower[index] > upper[index] + tolerance) {
+      return {Eigen::VectorXd::Zero(dimension), false, 0, 0,
+              "infeasible differential IK bounds"};
+    }
+  }
+
+  Eigen::MatrixXd hessian =
+      0.5 * (input_hessian + input_hessian.transpose());
+  Eigen::VectorXd unconstrained;
+  try {
+    unconstrained = solve_symmetric_system(hessian, -linear);
+  } catch (const std::exception &) {
+    return {Eigen::VectorXd::Zero(dimension), false, 0, 0,
+            "differential IK QP Hessian is singular"};
+  }
+
+  enum class BoundState { Free, Lower, Upper };
+  std::vector<BoundState> state(static_cast<std::size_t>(dimension),
+                                BoundState::Free);
+  Eigen::VectorXd x = unconstrained;
+  for (int index = 0; index < dimension; ++index) {
+    if (std::isfinite(lower[index]) && x[index] < lower[index]) {
+      x[index] = lower[index];
+      state[static_cast<std::size_t>(index)] = BoundState::Lower;
+    } else if (std::isfinite(upper[index]) && x[index] > upper[index]) {
+      x[index] = upper[index];
+      state[static_cast<std::size_t>(index)] = BoundState::Upper;
+    }
+  }
+
+  const int iteration_limit = std::max(1, max_iterations);
+  std::set<std::vector<int>> visited_active_sets;
+  for (int iteration = 0; iteration < iteration_limit; ++iteration) {
+    std::vector<int> active_set;
+    active_set.reserve(static_cast<std::size_t>(dimension));
+    for (const auto bound_state : state) {
+      active_set.push_back(static_cast<int>(bound_state));
+    }
+    if (!visited_active_sets.insert(active_set).second) {
+      return {x, false, 0, 0,
+              "differential IK active-set cycle detected"};
+    }
+
+    std::vector<int> free_indices;
+    free_indices.reserve(static_cast<std::size_t>(dimension));
+    for (int index = 0; index < dimension; ++index) {
+      if (state[static_cast<std::size_t>(index)] == BoundState::Free) {
+        free_indices.push_back(index);
+      }
+    }
+
+    Eigen::VectorXd candidate = x;
+    if (!free_indices.empty()) {
+      Eigen::MatrixXd free_hessian(free_indices.size(), free_indices.size());
+      Eigen::VectorXd free_rhs(free_indices.size());
+      for (std::size_t row = 0; row < free_indices.size(); ++row) {
+        const int row_index = free_indices[row];
+        free_rhs[static_cast<Eigen::Index>(row)] = -linear[row_index];
+        for (int index = 0; index < dimension; ++index) {
+          if (state[static_cast<std::size_t>(index)] != BoundState::Free) {
+            free_rhs[static_cast<Eigen::Index>(row)] -=
+                hessian(row_index, index) * x[index];
+          }
+        }
+        for (std::size_t column = 0; column < free_indices.size(); ++column) {
+          free_hessian(static_cast<Eigen::Index>(row),
+                       static_cast<Eigen::Index>(column)) =
+              hessian(row_index, free_indices[column]);
+        }
+      }
+      try {
+        const Eigen::VectorXd free_solution =
+            solve_symmetric_system(free_hessian, free_rhs);
+        for (std::size_t index = 0; index < free_indices.size(); ++index) {
+          candidate[free_indices[index]] = free_solution[
+              static_cast<Eigen::Index>(index)];
+        }
+      } catch (const std::exception &) {
+        return {x, false, 0, 0,
+                "differential IK free-set system is singular"};
+      }
+    }
+
+    // If the free solution crosses a bound, move to the first boundary and
+    // make that coordinate active.  This is the standard primal active-set
+    // step and preserves feasibility throughout the iteration.
+    double alpha = 1.0;
+    int hit_index = -1;
+    BoundState hit_state = BoundState::Free;
+    const Eigen::VectorXd direction = candidate - x;
+    for (const int index : free_indices) {
+      const double d = direction[index];
+      if (d < 0.0 && std::isfinite(lower[index]) &&
+          candidate[index] < lower[index]) {
+        const double ratio = (lower[index] - x[index]) / d;
+        if (ratio >= 0.0 && ratio < alpha) {
+          alpha = ratio;
+          hit_index = index;
+          hit_state = BoundState::Lower;
+        }
+      } else if (d > 0.0 && std::isfinite(upper[index]) &&
+                 candidate[index] > upper[index]) {
+        const double ratio = (upper[index] - x[index]) / d;
+        if (ratio >= 0.0 && ratio < alpha) {
+          alpha = ratio;
+          hit_index = index;
+          hit_state = BoundState::Upper;
+        }
+      }
+    }
+    if (hit_index >= 0) {
+      x += alpha * direction;
+      x[hit_index] = hit_state == BoundState::Lower ? lower[hit_index]
+                                                    : upper[hit_index];
+      state[static_cast<std::size_t>(hit_index)] = hit_state;
+      continue;
+    }
+    x = candidate;
+
+    const Eigen::VectorXd gradient = hessian * x + linear;
+    double largest_violation = tolerance;
+    int release_index = -1;
+    for (int index = 0; index < dimension; ++index) {
+      const auto bound_state = state[static_cast<std::size_t>(index)];
+      if (bound_state == BoundState::Lower && gradient[index] < -largest_violation) {
+        largest_violation = -gradient[index];
+        release_index = index;
+      } else if (bound_state == BoundState::Upper &&
+                 gradient[index] > largest_violation) {
+        largest_violation = gradient[index];
+        release_index = index;
+      }
+    }
+    if (release_index >= 0) {
+      state[static_cast<std::size_t>(release_index)] = BoundState::Free;
+      continue;
+    }
+
+    int active_lower = 0;
+    int active_upper = 0;
+    for (const auto bound_state : state) {
+      active_lower += bound_state == BoundState::Lower ? 1 : 0;
+      active_upper += bound_state == BoundState::Upper ? 1 : 0;
+    }
+    return {x, true, active_lower, active_upper, "solved"};
+  }
+
+  int active_lower = 0;
+  int active_upper = 0;
+  for (const auto bound_state : state) {
+    active_lower += bound_state == BoundState::Lower ? 1 : 0;
+    active_upper += bound_state == BoundState::Upper ? 1 : 0;
+  }
+  return {x, false, active_lower, active_upper,
+          "differential IK active-set iteration limit reached"};
 }
 
 std::vector<pinocchio::JointIndex>
@@ -415,6 +652,250 @@ IKResult RobotModel::inverse_kinematics(const Eigen::Matrix4d &target_matrix,
   }
   best.attempts = options.max_retries + 1;
   return best;
+}
+
+Eigen::VectorXd RobotModel::joint_velocity_limits() const {
+  Eigen::VectorXd limits = model_.velocityLimit;
+  if (limits.size() != model_.nv) {
+    throw std::runtime_error("Pinocchio velocity limits have an unexpected size");
+  }
+  return limits;
+}
+
+Eigen::VectorXd RobotModel::integrate_configuration(
+    const Eigen::VectorXd &q, const Eigen::VectorXd &delta_q) const {
+  validate_configuration(q);
+  if (delta_q.size() != model_.nv || !delta_q.array().isFinite().all()) {
+    throw std::invalid_argument(
+        "delta_q must be finite and have the model's nv entries");
+  }
+  const Eigen::VectorXd next_q = pinocchio::integrate(model_, q, delta_q);
+  if (!next_q.array().isFinite().all()) {
+    throw std::runtime_error("Pinocchio integration returned a non-finite q");
+  }
+  return next_q;
+}
+
+DifferentialIKResult RobotModel::differential_ik_step(
+    const Eigen::VectorXd &q_input, const Eigen::Matrix4d &target_matrix,
+    const DifferentialIKOptions &options,
+    const std::string &frame_name) const {
+  validate_configuration(q_input);
+  if (!std::isfinite(options.dt) || options.dt <= 0.0 ||
+      !std::isfinite(options.damping) || options.damping < 0.0 ||
+      !std::isfinite(options.frame_gain) || options.frame_gain < 0.0 ||
+      options.frame_gain > 1.0 ||
+      !std::isfinite(options.frame_lm_damping) ||
+      options.frame_lm_damping < 0.0 ||
+      !std::isfinite(options.posture_cost) || options.posture_cost < 0.0 ||
+      !std::isfinite(options.posture_gain) || options.posture_gain < 0.0 ||
+      options.posture_gain > 1.0 || options.qp_max_active_sets <= 0 ||
+      !std::isfinite(options.qp_tolerance) || options.qp_tolerance <= 0.0 ||
+      !std::isfinite(options.position_limit_gain) ||
+      options.position_limit_gain <= 0.0 ||
+      options.position_limit_gain > 1.0) {
+    throw std::invalid_argument("Invalid differential IK options");
+  }
+  if (!options.position_cost.array().isFinite().all() ||
+      !options.orientation_cost.array().isFinite().all() ||
+      (options.position_cost.array() < 0.0).any() ||
+      (options.orientation_cost.array() < 0.0).any()) {
+    throw std::invalid_argument(
+        "differential IK frame costs must be finite and non-negative");
+  }
+
+  const auto target = target_from_matrix(target_matrix);
+  const auto frame_id = resolve_frame(frame_name);
+  // The differential API follows Mink's configuration semantics: the caller
+  // chooses whether position limits are active.  Do not silently clamp q or
+  // the integrated result when that option is disabled.
+  Eigen::VectorXd q = q_input;
+
+  pinocchio::forwardKinematics(model_, data_, q);
+  pinocchio::updateFramePlacements(model_, data_);
+  const pinocchio::SE3 current_to_target = data_.oMf[frame_id].inverse() * target;
+  const Eigen::Matrix<double, 6, 1> frame_error =
+      pinocchio::log6(current_to_target).toVector();
+  pinocchio::computeJointJacobians(model_, data_, q);
+  pinocchio::updateFramePlacements(model_, data_);
+  pinocchio::Data::Matrix6x local_jacobian(6, model_.nv);
+  local_jacobian.setZero();
+  pinocchio::getFrameJacobian(model_, data_, frame_id, pinocchio::LOCAL,
+                              local_jacobian);
+  const Eigen::MatrixXd frame_jacobian =
+      -pinocchio::Jlog6(current_to_target.inverse()) * local_jacobian;
+
+  Eigen::Matrix<double, 6, 1> frame_cost;
+  frame_cost.head<3>() = options.position_cost;
+  frame_cost.tail<3>() = options.orientation_cost;
+  const Eigen::MatrixXd weighted_frame_jacobian =
+      frame_cost.asDiagonal() * frame_jacobian;
+  const Eigen::Matrix<double, 6, 1> weighted_frame_error =
+      frame_cost.cwiseProduct(options.frame_gain * frame_error);
+
+  Eigen::MatrixXd hessian =
+      weighted_frame_jacobian.transpose() * weighted_frame_jacobian;
+  Eigen::VectorXd linear =
+      weighted_frame_jacobian.transpose() * weighted_frame_error;
+  double frame_mu =
+      options.frame_lm_damping * weighted_frame_error.squaredNorm();
+  hessian.diagonal().array() += options.damping + frame_mu;
+
+  Eigen::VectorXd posture_target = options.posture_target;
+  if (posture_target.size() == 0) {
+    posture_target = home_configuration();
+  }
+  validate_configuration(posture_target);
+  if (options.posture_costs.size() != 0 &&
+      options.posture_costs.size() != model_.nv) {
+    throw std::invalid_argument(
+        "posture_costs must be empty or have nv entries");
+  }
+  if (!options.posture_costs.array().isFinite().all() ||
+      (options.posture_costs.array() < 0.0).any()) {
+    throw std::invalid_argument(
+        "differential IK posture costs must be finite and non-negative");
+  }
+  Eigen::VectorXd posture_costs =
+      options.posture_costs.size() == 0
+          ? Eigen::VectorXd::Constant(model_.nv, options.posture_cost)
+          : options.posture_costs;
+  if (posture_costs.maxCoeff() > 0.0) {
+    // Pinocchio difference(q_target, q) is q - q_target for this fixed
+    // revolute model, matching MuJoCo's mj_differentiatePos(target, q).
+    const Eigen::VectorXd posture_error =
+        pinocchio::difference(model_, posture_target, q);
+    const Eigen::MatrixXd weighted_posture_jacobian =
+        posture_costs.asDiagonal();
+    const Eigen::VectorXd weighted_posture_error =
+        posture_costs * (options.posture_gain * posture_error);
+    hessian += weighted_posture_jacobian.transpose() *
+               weighted_posture_jacobian;
+    linear += weighted_posture_jacobian.transpose() * weighted_posture_error;
+    const double posture_mu = options.posture_lm_damping *
+                              weighted_posture_error.squaredNorm();
+    hessian.diagonal().array() += posture_mu;
+  }
+
+  if (!hessian.array().isFinite().all() || !linear.array().isFinite().all()) {
+    throw std::runtime_error("differential IK QP objective is non-finite");
+  }
+
+  Eigen::VectorXd lower = Eigen::VectorXd::Constant(
+      model_.nv, -std::numeric_limits<double>::infinity());
+  Eigen::VectorXd upper = Eigen::VectorXd::Constant(
+      model_.nv, std::numeric_limits<double>::infinity());
+
+  if (options.enforce_position_limits) {
+    for (int index = 0; index < model_.nv; ++index) {
+      const double q_min = model_.lowerPositionLimit[index];
+      const double q_max = model_.upperPositionLimit[index];
+      if (std::isfinite(q_min)) {
+        lower[index] = std::max(lower[index],
+                                options.position_limit_gain * (q_min - q[index]));
+      }
+      if (std::isfinite(q_max)) {
+        upper[index] = std::min(upper[index],
+                                options.position_limit_gain * (q_max - q[index]));
+      }
+    }
+  }
+  if (options.enforce_velocity_limits) {
+    Eigen::VectorXd velocity_limits = options.velocity_limits;
+    if (velocity_limits.size() == 0) {
+      velocity_limits = joint_velocity_limits();
+    }
+    if (velocity_limits.size() != model_.nv ||
+        !velocity_limits.array().isFinite().all() ||
+        (velocity_limits.array() < 0.0).any()) {
+      throw std::invalid_argument(
+          "velocity_limits must be empty or finite non-negative nv values");
+    }
+    for (int index = 0; index < model_.nv; ++index) {
+      lower[index] = std::max(lower[index], -velocity_limits[index] * options.dt);
+      upper[index] = std::min(upper[index], velocity_limits[index] * options.dt);
+    }
+  }
+
+  const BoxQPResult qp = solve_box_qp(
+      hessian, linear, lower, upper, options.qp_max_active_sets,
+      options.qp_tolerance);
+  DifferentialIKResult result;
+  result.delta_q = qp.success ? qp.x : Eigen::VectorXd::Zero(model_.nv);
+  result.velocity = result.delta_q / options.dt;
+  result.active_lower = qp.active_lower;
+  result.active_upper = qp.active_upper;
+  result.success = qp.success;
+  result.status = qp.status;
+  result.task_error = frame_error.norm();
+  result.position_error = frame_error.head<3>().norm();
+  result.orientation_error = frame_error.tail<3>().norm();
+  if (qp.success) {
+    result.next_q = integrate_configuration(q, result.delta_q);
+    const ErrorState next_state = pose_error(result.next_q, target, frame_id);
+    result.next_task_error = next_state.norm;
+    result.objective =
+        0.5 * result.delta_q.dot(hessian * result.delta_q) +
+        linear.dot(result.delta_q);
+  } else {
+  result.next_q = q;
+    result.next_task_error = result.task_error;
+  }
+  return result;
+}
+
+IKResult RobotModel::mink_inverse_kinematics(
+    const Eigen::Matrix4d &target_matrix, const Eigen::VectorXd &q_seed,
+    const DifferentialIKOptions &options) const {
+  validate_configuration(q_seed);
+  if (options.max_iterations <= 0) {
+    throw std::invalid_argument(
+        "differential IK max_iterations must be positive");
+  }
+  if (!std::isfinite(options.tolerance) || options.tolerance <= 0.0) {
+    throw std::invalid_argument(
+        "differential IK tolerance must be finite and positive");
+  }
+  const auto target = target_from_matrix(target_matrix);
+  const auto frame_id = resolve_frame("");
+  const bool posture_enabled =
+      options.posture_gain > 0.0 &&
+      (options.posture_cost > 0.0 ||
+       (options.posture_costs.size() != 0 &&
+        options.posture_costs.maxCoeff() > 0.0));
+  Eigen::VectorXd q = q_seed;
+  for (int iteration = 0; iteration < options.max_iterations; ++iteration) {
+    const ErrorState state = pose_error(q, target, frame_id);
+    // Mink keeps all soft tasks active in the same QP.  Therefore a frame
+    // task that is already solved must not terminate the wrapper when a
+    // PostureTask is enabled: subsequent differential steps are precisely
+    // what moves the redundant elbow while balancing the frame residual.
+    if (state.norm <= options.tolerance && !posture_enabled) {
+      return IKResult{q, true, iteration, 1, state.norm,
+                      state.position_norm, state.orientation_norm};
+    }
+    const DifferentialIKResult step =
+        differential_ik_step(q, target_matrix, options);
+    if (!step.success) {
+      return IKResult{q, false, iteration + 1, 1, state.norm,
+                      state.position_norm, state.orientation_norm};
+    }
+    q = step.next_q;
+    if (step.delta_q.norm() <= options.qp_tolerance) {
+      const ErrorState next_state = pose_error(q, target, frame_id);
+      return IKResult{q,
+                      next_state.norm <= options.tolerance,
+                      iteration + 1,
+                      1,
+                      next_state.norm,
+                      next_state.position_norm,
+                      next_state.orientation_norm};
+    }
+  }
+  const ErrorState state = pose_error(q, target, frame_id);
+  return IKResult{q, state.norm <= options.tolerance,
+                  options.max_iterations, 1, state.norm, state.position_norm,
+                  state.orientation_norm};
 }
 
 Eigen::MatrixXd

@@ -2,9 +2,26 @@
 
 #include <Eigen/Core>
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+
+namespace {
+
+double pose_matrix_distance(const Eigen::Matrix4d &first,
+                            const Eigen::Matrix4d &second) {
+  return (first.topLeftCorner<3, 3>() - second.topLeftCorner<3, 3>()).norm() +
+         (first.topRightCorner<3, 1>() - second.topRightCorner<3, 1>()).norm();
+}
+
+void require(bool condition, const std::string &message) {
+  if (!condition) {
+    throw std::runtime_error(message);
+  }
+}
+
+} // namespace
 
 int main() {
   try {
@@ -26,6 +43,54 @@ int main() {
     q_target[4] += 0.20;
     q_target[6] -= 0.25;
     const Eigen::Matrix4d target_pose = model.forward_kinematics(q_target);
+
+    // Mink's API is differential: one call returns a bounded tangent step,
+    // not a final q.  At the target the step should be numerically zero.
+    fr3_control_sim::DifferentialIKOptions differential_options;
+    differential_options.posture_cost = 0.0;
+    const auto zero_step =
+        model.differential_ik_step(q_home, home_pose, differential_options);
+    require(zero_step.success, "Differential IK zero step was not solved");
+    require(zero_step.delta_q.norm() < 1e-8,
+            "Differential IK moved at an already solved target");
+    require(zero_step.next_task_error < 1e-8,
+            "Differential IK zero-step residual is too large");
+
+    const auto one_step =
+        model.differential_ik_step(q_home, target_pose, differential_options);
+    require(one_step.success, "Differential IK one-step solve failed");
+    require(pose_matrix_distance(model.forward_kinematics(one_step.next_q),
+                                 target_pose) <
+                pose_matrix_distance(home_pose, target_pose),
+            "Differential IK one step did not reduce pose error");
+
+    // The velocity box is expressed in tangent displacement units, exactly as
+    // in Mink: |delta_q_i| <= vmax_i * dt.
+    differential_options.dt = 1e-3;
+    differential_options.enforce_velocity_limits = true;
+    const auto bounded_step =
+        model.differential_ik_step(q_home, target_pose, differential_options);
+    const Eigen::VectorXd velocity_limits = model.joint_velocity_limits();
+    for (int index = 0; index < model.nv(); ++index) {
+      require(std::abs(bounded_step.delta_q[index]) <=
+                  velocity_limits[index] * differential_options.dt + 1e-9,
+              "Differential IK violated a velocity limit");
+    }
+
+    // Position limits are linearized before solving, rather than applied only
+    // by a post-solve clamp.
+    const auto limits = model.joint_limits();
+    Eigen::VectorXd q_at_upper = q_home;
+    q_at_upper[0] = limits[0].second - 1e-6;
+    Eigen::VectorXd q_upper_target = q_at_upper;
+    q_upper_target[0] = limits[0].second;
+    fr3_control_sim::DifferentialIKOptions position_options;
+    position_options.posture_cost = 0.0;
+    position_options.enforce_velocity_limits = false;
+    const auto position_step = model.differential_ik_step(
+        q_at_upper, model.forward_kinematics(q_upper_target), position_options);
+    require(position_step.next_q[0] <= limits[0].second + 1e-9,
+            "Differential IK violated an upper position limit");
 
     fr3_control_sim::IKOptions options;
     options.max_iterations = 1500;
@@ -69,6 +134,31 @@ int main() {
       throw std::runtime_error(
           "Null-space posture objective did not recover home");
     }
+
+    // The Mink-style wrapper keeps iterating after the frame task reaches its
+    // tolerance when a soft PostureTask is enabled.  With no posture task, an
+    // already exact target returns the seed immediately; with posture cost it
+    // should move the redundant configuration toward the FR3 home posture.
+    const Eigen::Matrix4d skewed_target = model.forward_kinematics(q_skewed);
+    fr3_control_sim::DifferentialIKOptions no_posture;
+    no_posture.max_iterations = 100;
+    no_posture.posture_cost = 0.0;
+    const auto no_posture_result =
+        model.mink_inverse_kinematics(skewed_target, q_skewed, no_posture);
+    require(no_posture_result.success,
+            "Mink wrapper failed with an already exact target");
+    require((no_posture_result.q - q_skewed).norm() < 1e-8,
+            "Mink wrapper changed an exact no-posture solution");
+
+    fr3_control_sim::DifferentialIKOptions soft_posture;
+    soft_posture.max_iterations = 200;
+    soft_posture.tolerance = 1e-5;
+    soft_posture.posture_cost = 0.1;
+    const auto soft_posture_result =
+        model.mink_inverse_kinematics(skewed_target, q_skewed, soft_posture);
+    require((soft_posture_result.q - q_home).norm() <
+                (no_posture_result.q - q_home).norm(),
+            "Mink PostureTask did not reduce home-posture distance");
 
     const Eigen::MatrixXd trajectory =
         model.minimum_jerk_trajectory(q_home, result.q, 1.0, 0.02);

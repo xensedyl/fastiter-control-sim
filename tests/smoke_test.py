@@ -35,6 +35,25 @@ def main() -> None:
     assert np.allclose(trajectory[0], home)
     assert np.allclose(trajectory[-1], result.q)
 
+    differential_options = fr3.DifferentialIKOptions()
+    differential_options.posture_cost = 0.0
+    differential_options.enforce_velocity_limits = True
+    differential_options.dt = 1e-3
+    differential_step = model.differential_ik_step(home, target, differential_options)
+    assert differential_step.success, differential_step
+    assert differential_step.delta_q.shape == (7,)
+    assert differential_step.velocity.shape == (7,)
+    assert differential_step.next_q.shape == (7,)
+    velocity_limits = np.asarray(model.joint_velocity_limits(), dtype=float)
+    assert np.all(
+        np.abs(differential_step.delta_q)
+        <= velocity_limits * differential_options.dt + 1e-9
+    )
+
+    exact_step = model.differential_ik_step(home, model.forward_kinematics(home))
+    assert exact_step.success, exact_step
+    assert np.linalg.norm(exact_step.delta_q) < 1e-8
+
     skewed_seed = np.radians(
         [-27.75, -48.05, 17.44, -134.54, 12.89, 87.89, 29.59]
     )
@@ -59,6 +78,7 @@ def main() -> None:
     print(f"  IK residual: {result.error:.3e}")
     print(f"  position round-trip error: {position_error:.3e} m")
     print(f"  null-space home distance: {posture_distance:.3e} rad")
+    print(f"  differential step norm: {np.linalg.norm(differential_step.delta_q):.3e} rad")
 
 
 if __name__ == "__main__":
