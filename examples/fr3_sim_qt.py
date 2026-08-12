@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Sequence
 
 import numpy as np
@@ -22,6 +23,9 @@ DEFAULT_DESCRIPTION_ROOT = Path(
 # Set it to 0.0 to disable the constraint.  It can also be overridden with
 # the --posture-gain command-line option or the IK-tab spin box.
 DEFAULT_POSTURE_GAIN = float(fr3.IKOptions().posture_gain)
+DEFAULT_IK_UPDATE_HZ = 30.0
+DEFAULT_RENDER_HZ = 60.0
+DEFAULT_SMOOTH_TIME = 0.12
 
 try:
     from PySide6.QtCore import QSignalBlocker, Qt, QTimer, QUrl, Signal
@@ -166,6 +170,9 @@ class Fr3SimWindow(QMainWindow):
         *,
         initial_mode: str = "fk",
         posture_gain: float = DEFAULT_POSTURE_GAIN,
+        ik_update_hz: float = DEFAULT_IK_UPDATE_HZ,
+        render_hz: float = DEFAULT_RENDER_HZ,
+        smooth_time: float = DEFAULT_SMOOTH_TIME,
     ) -> None:
         super().__init__()
         self.model = model
@@ -176,8 +183,21 @@ class Fr3SimWindow(QMainWindow):
         self.ik_options = fr3.IKOptions()
         if not np.isfinite(posture_gain) or posture_gain < 0.0:
             raise ValueError("--posture-gain must be a finite non-negative number")
+        if not np.isfinite(ik_update_hz) or ik_update_hz <= 0.0:
+            raise ValueError("--ik-update-hz must be a finite positive number")
+        if not np.isfinite(render_hz) or render_hz <= 0.0:
+            raise ValueError("--render-hz must be a finite positive number")
+        if not np.isfinite(smooth_time) or smooth_time < 0.0:
+            raise ValueError("--smooth-time must be a finite non-negative number")
         self.ik_options.posture_gain = float(posture_gain)
+        self.ik_update_hz = float(ik_update_hz)
+        self.render_hz = float(render_hz)
+        self.smooth_time = float(smooth_time)
         self._syncing_controls = False
+        self._ik_pending = False
+        self._animation_start_q = self.current_q.copy()
+        self._animation_goal_q = self.current_q.copy()
+        self._animation_started_at = time.monotonic()
 
         self.fk_timer = QTimer(self)
         self.fk_timer.setSingleShot(True)
@@ -186,14 +206,22 @@ class Fr3SimWindow(QMainWindow):
 
         self.ik_timer = QTimer(self)
         self.ik_timer.setSingleShot(True)
-        self.ik_timer.setInterval(80)
+        # Do not restart this timer on every slider event.  It samples the
+        # newest target at a bounded rate, so dragging continuously still moves.
+        self.ik_timer.setInterval(max(1, round(1000.0 / self.ik_update_hz)))
         self.ik_timer.timeout.connect(self._solve_ik)
+
+        self.render_timer = QTimer(self)
+        self.render_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.render_timer.setInterval(max(1, round(1000.0 / self.render_hz)))
+        self.render_timer.timeout.connect(self._render_animation_frame)
 
         self.setWindowTitle("FR3 Pinocchio FK / IK Control")
         self.resize(100, 300)
         self._build_ui()
         self._reset_home()
         self.tabs.setCurrentIndex(0 if initial_mode == "fk" else 1)
+        self.render_timer.start()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -280,7 +308,9 @@ class Fr3SimWindow(QMainWindow):
 
         description = QLabel(
             "Drag x/y/z in meters and roll/pitch/yaw in radians. "
-            "IK is solved from the last successful configuration."
+            "IK tracks the latest slider target at a fixed rate, while the "
+            "displayed joint motion is smoothed independently. The FK sliders "
+            "show the latest solved target, not an in-between display frame."
         )
         description.setWordWrap(True)
         layout.addWidget(description)
@@ -333,7 +363,7 @@ class Fr3SimWindow(QMainWindow):
         current_target_button = QPushButton("Set target from current pose")
         current_target_button.clicked.connect(self._sync_ik_target_from_current)
         solve_button = QPushButton("Solve IK now")
-        solve_button.clicked.connect(self._solve_ik)
+        solve_button.clicked.connect(self._solve_ik_now)
         ik_buttons.addWidget(current_target_button)
         ik_buttons.addStretch(1)
         ik_buttons.addWidget(solve_button)
@@ -373,19 +403,70 @@ class Fr3SimWindow(QMainWindow):
         if self.visualizer is not None:
             self.visualizer.update(q)
 
+    def _sample_animation(self, now: float | None = None) -> np.ndarray:
+        if self.smooth_time <= 0.0:
+            return self._animation_goal_q.copy()
+        elapsed = (
+            (time.monotonic() if now is None else now) - self._animation_started_at
+        )
+        progress = float(np.clip(elapsed / self.smooth_time, 0.0, 1.0))
+        progress2 = progress * progress
+        progress3 = progress2 * progress
+        blend = (
+            10.0 * progress3
+            - 15.0 * progress3 * progress
+            + 6.0 * progress3 * progress2
+        )
+        return self._animation_start_q + blend * (
+            self._animation_goal_q - self._animation_start_q
+        )
+
+    def _set_display_goal(self, q: np.ndarray, *, immediate: bool = False) -> None:
+        goal = np.asarray(q, dtype=float)
+        if immediate or self.smooth_time <= 0.0:
+            self.current_q = goal.copy()
+            self._animation_start_q = goal.copy()
+            self._animation_goal_q = goal.copy()
+            self._animation_started_at = time.monotonic()
+            self._update_visualizer(goal)
+            return
+
+        now = time.monotonic()
+        # Retarget from the pose currently on screen to avoid visible jumps.
+        self.current_q = self._sample_animation(now)
+        self._animation_start_q = self.current_q.copy()
+        self._animation_goal_q = goal.copy()
+        self._animation_started_at = now
+
+    def _render_animation_frame(self) -> None:
+        if np.array_equal(self.current_q, self._animation_goal_q):
+            return
+        now = time.monotonic()
+        if (
+            self.smooth_time <= 0.0
+            or now - self._animation_started_at >= self.smooth_time
+        ):
+            self.current_q = self._animation_goal_q.copy()
+        else:
+            self.current_q = self._sample_animation(now)
+        self._update_visualizer(self.current_q)
+
     def _schedule_fk(self, _value: float) -> None:
         if self._syncing_controls:
             return
         self.ik_timer.stop()
+        self._ik_pending = False
         self.fk_timer.start()
 
     def _schedule_ik(self, _value: float) -> None:
         if self._syncing_controls:
             return
         self.fk_timer.stop()
+        self._ik_pending = True
         self.ik_status.setText("Solving IK...")
         self.ik_status.setStyleSheet("font-family: monospace; color: #b36b00;")
-        self.ik_timer.start()
+        if not self.ik_timer.isActive():
+            self.ik_timer.start()
 
     def _joint_values_radians(self) -> np.ndarray:
         return np.radians([control.value() for control in self.fk_controls])
@@ -430,8 +511,7 @@ class Fr3SimWindow(QMainWindow):
         try:
             q = self._joint_values_radians()
             pose = np.asarray(self.model.forward_kinematics(q), dtype=float)
-            self.current_q = q
-            self._update_visualizer(q)
+            self._set_display_goal(q, immediate=True)
             self.fk_status.setText(
                 f"q [deg] = {np.array2string(np.degrees(q), precision=2)}\n"
                 + self._pose_text(pose)
@@ -443,10 +523,11 @@ class Fr3SimWindow(QMainWindow):
 
     def _solve_ik(self) -> None:
         self.ik_timer.stop()
+        self._ik_pending = False
         try:
             target = self._target_pose()
             result = self.model.inverse_kinematics(
-                target, self.current_q, self.ik_options
+                target, self._animation_goal_q, self.ik_options
             )
             if not result.success:
                 self.ik_status.setText(
@@ -463,9 +544,8 @@ class Fr3SimWindow(QMainWindow):
                 return
 
             solved = np.asarray(result.q, dtype=float)
-            self.current_q = solved
             self._set_fk_controls(solved)
-            self._update_visualizer(solved)
+            self._set_display_goal(solved)
             solved_pose = np.asarray(
                 self.model.forward_kinematics(solved), dtype=float
             )
@@ -483,9 +563,19 @@ class Fr3SimWindow(QMainWindow):
         except Exception as exc:  # keep the GUI responsive on invalid targets
             self.ik_status.setText(f"IK failed: {exc}")
             self.ik_status.setStyleSheet("font-family: monospace; color: #b00020;")
+        finally:
+            if self._ik_pending and self.tabs.currentIndex() == 1:
+                self.ik_timer.start()
+
+    def _solve_ik_now(self) -> None:
+        self._ik_pending = True
+        self._solve_ik()
 
     def _sync_ik_target_from_current(self) -> None:
         self.ik_timer.stop()
+        self._ik_pending = False
+        displayed = self._sample_animation()
+        self._set_display_goal(displayed, immediate=True)
         pose = np.asarray(
             self.model.forward_kinematics(self.current_q), dtype=float
         )
@@ -499,24 +589,27 @@ class Fr3SimWindow(QMainWindow):
     def _reset_home(self) -> None:
         self.fk_timer.stop()
         self.ik_timer.stop()
-        self.current_q = self.home_q.copy()
+        self._ik_pending = False
+        self._set_display_goal(self.home_q, immediate=True)
         self._set_fk_controls(self.current_q)
         pose = np.asarray(
             self.model.forward_kinematics(self.current_q), dtype=float
         )
         self._set_ik_controls_from_pose(pose)
-        self._update_visualizer(self.current_q)
         self.fk_status.setText(
             f"q [deg] = {np.array2string(np.degrees(self.current_q), precision=2)}\n"
             + self._pose_text(pose)
         )
         self.fk_status.setStyleSheet("font-family: monospace; color: #1b7f2a;")
-        self.ik_status.setText("IK target initialized from home.\n" + self._pose_text(pose))
+        self.ik_status.setText(
+            "IK target initialized from home.\n" + self._pose_text(pose)
+        )
         self.ik_status.setStyleSheet("font-family: monospace;")
 
     def _on_tab_changed(self, index: int) -> None:
         if index == 0:
             self.ik_timer.stop()
+            self._ik_pending = False
             self._set_fk_controls(self.current_q)
             self._apply_fk()
         else:
@@ -557,6 +650,33 @@ def _arguments() -> argparse.Namespace:
             "0 disables the constraint)."
         ),
     )
+    parser.add_argument(
+        "--ik-update-hz",
+        type=float,
+        default=DEFAULT_IK_UPDATE_HZ,
+        help=(
+            "Maximum rate for solving the latest slider target "
+            f"(default: {DEFAULT_IK_UPDATE_HZ:g} Hz)."
+        ),
+    )
+    parser.add_argument(
+        "--render-hz",
+        type=float,
+        default=DEFAULT_RENDER_HZ,
+        help=(
+            "MeshCat interpolation refresh rate "
+            f"(default: {DEFAULT_RENDER_HZ:g} Hz)."
+        ),
+    )
+    parser.add_argument(
+        "--smooth-time",
+        type=float,
+        default=DEFAULT_SMOOTH_TIME,
+        help=(
+            "Seconds used to smoothly retarget each IK result; 0 disables "
+            f"smoothing (default: {DEFAULT_SMOOTH_TIME:g})."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -566,6 +686,11 @@ def main() -> int:
     urdf_path = _resolve_urdf(args.urdf, description_root)
     model = fr3.RobotModel(str(urdf_path))
     print(f"IK posture_gain (null-space): {args.posture_gain:g}")
+    print(
+        "Qt smoothing: "
+        f"IK {args.ik_update_hz:g} Hz, render {args.render_hz:g} Hz, "
+        f"smooth_time {args.smooth_time:g} s"
+    )
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("FR3 Control Sim")
@@ -588,6 +713,9 @@ def main() -> int:
         urdf_path,
         initial_mode=args.mode,
         posture_gain=args.posture_gain,
+        ik_update_hz=args.ik_update_hz,
+        render_hz=args.render_hz,
+        smooth_time=args.smooth_time,
     )
     window.show()
     return app.exec()
