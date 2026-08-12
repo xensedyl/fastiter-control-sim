@@ -1,8 +1,8 @@
-# FR3 Pinocchio C++ 仿真
+# FR3 Pinocchio C++ / Mink differential IK 仿真
 
-本工程使用 Franka 官方 `franka_description` 模型，实现 FR3 的正运动学、雅可比、逆运动学和最小加加速度关节轨迹。
+本工程使用 Franka 官方 `franka_description` 模型，实现 FR3 的正运动学、雅可比和 Mink 风格 differential IK（微分逆运动学），并提供最小加加速度关节轨迹。
 
-- Pinocchio 计算、IK 和轨迹生成全部在 C++ 中完成。
+- Pinocchio 计算、Mink differential IK 和轨迹生成全部在 C++ 中完成。
 - Python 只通过 pybind11 调用 C++，并负责命令行和 MeshCat 显示。
 - 机械臂对外为 7 自由度，末端坐标系为 `fr3_hand_tcp`。
 - `pip install -e .` 会自动调用 CMake 编译 C++ 扩展，不需要 `build.sh` 或 `run_sim.sh`。
@@ -21,7 +21,7 @@ models/fr3_franka_hand.urdf
 environment.yml                          mamba 环境定义
 CMakeLists.txt                           C++/pybind11 构建配置
 cpp/include/fr3_control_sim/robot_model.hpp
-cpp/src/robot_model.cpp                  Pinocchio FK/IK/轨迹实现
+cpp/src/robot_model.cpp                  Pinocchio FK/Mink IK/轨迹实现
 cpp/src/bindings.cpp                     pybind11 绑定
 python/fr3_control_sim/                  Python 包和 MeshCat 显示
 examples/fr3_sim.py                      仿真入口
@@ -269,29 +269,38 @@ python examples/fr3_sim.py --mode ik \
   --target 0.35 0.10 0.45 3.1415926 0.0 0.2
 ```
 
-可用 `--posture-gain` 修改零空间 home 姿态约束强度；程序启动或求解时会打印当前值：
+Mink 的姿态偏置由软 `PostureTask` 控制。`--posture-cost` 是任务权重，
+`--posture-gain` 是任务增益（范围 `[0, 1]`），`--mink-steps` 是外层 differential
+IK 步数：
 
 ```bash
 python examples/fr3_sim.py --mode ik \
   --target 0.35 0.10 0.45 \
-  --posture-gain 0.1
+  --posture-cost 0.01 \
+  --posture-gain 1.0 \
+  --mink-steps 300
 ```
 
-可以直接输入或拖动数值，范围为 `0 ~ 10` 。修改后会自动重新求解 IK：
+可选开启 FR3 关节速度限制：
 
-- `0` ：关闭零空间约束
-- `0.1` ：默认值
-- 增大：更强地趋向 home 姿态，但可能增加迭代次数
+```bash
+python examples/fr3_sim.py --mode ik \
+  --target 0.35 0.10 0.45 \
+  --posture-cost 0.01 --velocity-limits
+```
 
 IK 成功后，C++ 会生成 50 Hz 最小加加速度关节轨迹，并由 MeshCat 播放。
 
-FR3 是 7 自由度机械臂，末端位姿任务只有 6 个约束。C++ IK 默认在 Jacobian 零空间中加入 home 姿态约束，使冗余肘部姿态趋向：
+FR3 是 7 自由度机械臂，末端位姿任务只有 6 个约束。Mink `PostureTask` 是与末端
+`FrameTask` 同时进入加权 QP 的软任务，因此 `posture_cost=0` 时会保留最小二乘
+路径，增大它会让冗余肘部更偏向 home：
 
 ```text
 [0, -45, 0, -135, 0, 90, 45] deg
 ```
 
-`IKOptions.posture_gain` 控制约束强度，默认值为 `0.1`；设置为 `0.0` 可关闭零空间姿态约束。求解器会先收敛末端任务，进入位姿容差后再尽量优化零空间姿态，因此不会降低远距离目标的主任务优先级。较大的增益可能增加迭代次数；通常使用默认值即可。
+这是软权衡，不是旧式显式 `N=I-J^+J` 后处理；远距离目标的单个 differential step 也不保证
+非线性位姿误差立刻下降，通常需要在外层循环中重复调用。
 
 ### Qt 滑条控制
 
@@ -305,7 +314,8 @@ python examples/fr3_sim_qt.py
 
 - `FK - Joint sliders`：拖动 `joint1` 到 `joint7`，单位为度；范围直接来自 C++ 模型中的关节限位。
 - `IK - XYZ / RPY sliders`：拖动 `x/y/z`（米）和 `roll/pitch/yaw`（弧度），停止拖动约 80 ms 后调用 C++ IK。
-- IK 页签中的 `posture_gain (null-space)` 可直接编辑零空间 home 姿态约束强度；改动后会自动重新求解，设置为 `0` 可关闭约束。
+- IK 页签中的 Mink 参数 `posture_cost`、`posture_gain`、`steps`、`dt` 和
+  `velocity limits` 可直接编辑；改动后会自动重新求解。
 
 IK 页签以上一次成功解作为下一次求解初值。不可达目标会显示红色错误信息，并保持机器人上一次成功姿态不变。
 
@@ -315,10 +325,11 @@ IK 页签以上一次成功解作为下一次求解初值。不可达目标会�
 python examples/fr3_sim_qt.py --mode ik
 ```
 
-也可以在命令行指定初始零空间约束增益，之后仍可在 IK 页签中继续修改：
+也可以在命令行指定 Mink 参数，之后仍可在 IK 页签中继续修改：
 
 ```bash
-python examples/fr3_sim_qt.py --mode ik --posture-gain 0.1
+python examples/fr3_sim_qt.py --mode ik \
+  --posture-cost 0.01 --posture-gain 1.0 --mink-steps 300
 ```
 
 只运行 Qt 控制面板、不启动 MeshCat：
@@ -340,7 +351,7 @@ pip install -e .
 
 ```python
 import numpy as np
-from fr3_control_sim import IKOptions, RobotModel, pose_from_xyz_rpy
+from fr3_control_sim import DifferentialIKOptions, RobotModel, pose_from_xyz_rpy
 
 model = RobotModel("models/fr3_franka_hand.urdf")
 q0 = model.home_configuration()
@@ -352,20 +363,35 @@ target = pose_from_xyz_rpy(
     np.array([0.35, 0.10, 0.45]),
     np.array([3.1415926, 0.0, 0.2]),
 )
-result = model.inverse_kinematics(target, q0, IKOptions())
+options = DifferentialIKOptions()
+options.posture_cost = 0.01
+options.posture_gain = 1.0
+options.max_iterations = 300
+result = model.mink_inverse_kinematics(target, q0, options)
+if not result.success:
+    raise RuntimeError(f"Mink IK failed: {result.error}")
 trajectory = model.minimum_jerk_trajectory(q0, result.q, 2.0, 0.02)
 ```
 
-## Mink 风格 differential IK（`feat/mink`）
+## Mink 风格 differential IK
 
-`feat/mink` 保留原有的 `inverse_kinematics()`，另外增加了与
-`/home/xense/fastiter/mink` 思路对应的微分 IK 接口。两者的区别是：
+本工程现在只提供 Mink 风格的 IK，不再提供旧的批量 DLS `inverse_kinematics()`
+或 `IKOptions` 接口。底层仍使用官方 FR3 URDF 和 Pinocchio，Python 只通过 pybind11
+调用 C++。
 
-- `inverse_kinematics()` 是一次调用内部迭代到最终关节角的 Pinocchio DLS IK，返回 `q`。
-- `differential_ik_step()` 每次只解一个局部加权 QP，返回 `delta_q`、`velocity=delta_q/dt` 和 `next_q`；控制循环需要反复调用它。
-- C++ 端实现了 Mink 的 6D FrameTask、软 PostureTask、阻尼，以及 FR3 的线性化关节位置/速度盒约束。Python 只负责调用 pybind，不在 Python 中运行 FK、Jacobian 或 QP。
-- Mink 原版使用 MuJoCo MJCF 和 `qpsolvers`；本分支直接使用同一官方 FR3 URDF、Pinocchio 和 Eigen，因此不需要把 MuJoCo 或 Python `qpsolvers` 加入工程。
-- 当前迁移版针对 FR3 的 7 个转动关节；通用多任务、等式约束和碰撞约束需要后续接入原生 C++ QP 后端，尚未伪装成已支持的功能。
+- `differential_ik_step()` 每次解一个局部加权 QP，返回 `delta_q`、
+  `velocity=delta_q/dt` 和 `next_q`；控制循环应反复调用它。
+- `mink_inverse_kinematics()` 只是 C++ convenience wrapper，内部重复调用上述单步，
+  返回最终 `q` 和误差诊断。
+- 已实现 Mink 的 6D FrameTask、软 PostureTask、阻尼，以及 FR3 位置/速度盒约束。
+- 当前迁移版针对 FR3 的 7 个转动关节；通用多任务、等式约束和碰撞约束尚未接入。
+- Mink 原版使用 MuJoCo + `qpsolvers`；本工程将任务组装和求解放在 C++/Eigen 中，
+  不在 Python 中运行 FK、Jacobian 或 QP。
+
+Mink differential IK 是局部、无 line-search 的控制步：单步不保证远距离目标的
+非线性误差一定下降，`mink_inverse_kinematics()` 也可能在局部极小值或关节限位处
+返回 `success=false`。实时使用时应检查每个 `DifferentialIKResult.success`，并由控制
+循环决定步数、dt 和失败处理。
 
 ### 单步调用
 
@@ -417,7 +443,8 @@ options.max_iterations = 300
 result = model.mink_inverse_kinematics(target, q, options)
 ```
 
-`posture_cost` 与原有批量 IK 的 `IKOptions.posture_gain` 不是同一个参数：前者是 Mink 风格 QP 中的软任务权重，后者是现有批量求解器在末端收敛后使用的显式零空间步长。
+`posture_cost` 是软任务权重，`posture_gain` 是 Mink task gain；两者都只作用于
+Mink QP，不是显式零空间投影参数。
 
 ## 可选：手动运行 C++ 测试
 

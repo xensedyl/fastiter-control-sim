@@ -5,51 +5,14 @@
 #include <pybind11/stl.h>
 
 namespace py = pybind11;
-using fr3_control_sim::IKOptions;
-using fr3_control_sim::IKResult;
 using fr3_control_sim::DifferentialIKOptions;
 using fr3_control_sim::DifferentialIKResult;
+using fr3_control_sim::MinkIKResult;
 using fr3_control_sim::RobotModel;
 
 PYBIND11_MODULE(_fr3_sim, module) {
   module.doc() =
-      "FR3 forward/inverse kinematics implemented in C++ with Pinocchio";
-
-  py::class_<IKOptions>(module, "IKOptions")
-      .def(py::init<>())
-      .def_readwrite("max_iterations", &IKOptions::max_iterations)
-      .def_readwrite("max_retries", &IKOptions::max_retries)
-      .def_readwrite("tolerance", &IKOptions::tolerance)
-      .def_readwrite("damping", &IKOptions::damping)
-      .def_readwrite("step_size", &IKOptions::step_size)
-      .def_readwrite("max_step_norm", &IKOptions::max_step_norm)
-      .def_readwrite("posture_gain", &IKOptions::posture_gain)
-      .def_readwrite("line_search_steps", &IKOptions::line_search_steps)
-      .def_readwrite("random_seed", &IKOptions::random_seed)
-      .def("__repr__", [](const IKOptions &options) {
-        return "IKOptions(max_iterations=" +
-               std::to_string(options.max_iterations) +
-               ", max_retries=" + std::to_string(options.max_retries) +
-               ", tolerance=" + std::to_string(options.tolerance) +
-               ", posture_gain=" + std::to_string(options.posture_gain) +
-               ")";
-      });
-
-  py::class_<IKResult>(module, "IKResult")
-      .def_readonly("q", &IKResult::q)
-      .def_readonly("success", &IKResult::success)
-      .def_readonly("iterations", &IKResult::iterations)
-      .def_readonly("attempts", &IKResult::attempts)
-      .def_readonly("error", &IKResult::error)
-      .def_readonly("position_error", &IKResult::position_error)
-      .def_readonly("orientation_error", &IKResult::orientation_error)
-      .def("__repr__", [](const IKResult &result) {
-        return "IKResult(success=" +
-               std::string(result.success ? "True" : "False") +
-               ", error=" + std::to_string(result.error) +
-               ", iterations=" + std::to_string(result.iterations) +
-               ", attempts=" + std::to_string(result.attempts) + ")";
-      });
+      "FR3 FK and Mink-style differential IK implemented in C++ with Pinocchio";
 
   py::class_<DifferentialIKOptions>(module, "DifferentialIKOptions")
       .def(py::init<>())
@@ -112,6 +75,20 @@ PYBIND11_MODULE(_fr3_sim, module) {
                result.status + "')";
       });
 
+  py::class_<MinkIKResult>(module, "MinkIKResult")
+      .def_readonly("q", &MinkIKResult::q)
+      .def_readonly("success", &MinkIKResult::success)
+      .def_readonly("iterations", &MinkIKResult::iterations)
+      .def_readonly("error", &MinkIKResult::error)
+      .def_readonly("position_error", &MinkIKResult::position_error)
+      .def_readonly("orientation_error", &MinkIKResult::orientation_error)
+      .def("__repr__", [](const MinkIKResult &result) {
+        return "MinkIKResult(success=" +
+               std::string(result.success ? "True" : "False") +
+               ", error=" + std::to_string(result.error) +
+               ", iterations=" + std::to_string(result.iterations) + ")";
+      });
+
   py::class_<RobotModel>(module, "RobotModel")
       .def(py::init<const std::string &, const std::string &, double>(),
            py::arg("urdf_path"), py::arg("end_effector_frame") = "fr3_hand_tcp",
@@ -133,9 +110,6 @@ PYBIND11_MODULE(_fr3_sim, module) {
       .def("jacobian", &RobotModel::jacobian, py::arg("q"),
            py::arg("frame_name") = "")
       .def("frame_placements", &RobotModel::frame_placements, py::arg("q"))
-      .def("inverse_kinematics", &RobotModel::inverse_kinematics,
-           py::arg("target"), py::arg("q_seed"),
-           py::arg("options") = IKOptions())
       .def("differential_ik_step", &RobotModel::differential_ik_step,
            py::arg("q"), py::arg("target"),
            py::arg("options") = DifferentialIKOptions(),

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pybind-level FK/IK smoke test; all kinematics execute in C++."""
+"""Pybind-level FK/Mink-IK smoke test; all kinematics execute in C++."""
 
 from __future__ import annotations
 
@@ -15,13 +15,18 @@ import fr3_control_sim as fr3
 
 def main() -> None:
     model = fr3.RobotModel(str(PROJECT_ROOT / "models" / "fr3_franka_hand.urdf"))
+    assert not hasattr(fr3, "IKOptions")
+    assert not hasattr(fr3, "IKResult")
+    assert not hasattr(model, "inverse_kinematics")
     assert model.nq == 7
     assert model.joint_names == [f"fr3_joint{index}" for index in range(1, 8)]
 
     home = np.asarray(model.home_configuration(), dtype=float)
     target_q = home + np.array([0.20, 0.10, -0.15, 0.10, 0.12, -0.10, -0.20])
     target = np.asarray(model.forward_kinematics(target_q), dtype=float)
-    result = model.inverse_kinematics(target, home, fr3.IKOptions())
+    mink_options = fr3.DifferentialIKOptions()
+    mink_options.posture_cost = 0.01
+    result = model.mink_inverse_kinematics(target, home, mink_options)
     assert result.success, result
 
     recovered = np.asarray(model.forward_kinematics(result.q), dtype=float)
@@ -64,10 +69,10 @@ def main() -> None:
         ),
         dtype=float,
     )
-    posture_options = fr3.IKOptions()
-    posture_options.max_retries = 0
-    posture_options.posture_gain = 0.1
-    posture_result = model.inverse_kinematics(
+    posture_options = fr3.DifferentialIKOptions()
+    posture_options.max_iterations = 300
+    posture_options.posture_cost = 0.01
+    posture_result = model.mink_inverse_kinematics(
         near_home_target, skewed_seed, posture_options
     )
     assert posture_result.success, posture_result
@@ -77,7 +82,7 @@ def main() -> None:
     print("Python/pybind smoke test passed")
     print(f"  IK residual: {result.error:.3e}")
     print(f"  position round-trip error: {position_error:.3e} m")
-    print(f"  null-space home distance: {posture_distance:.3e} rad")
+    print(f"  Mink posture home distance: {posture_distance:.3e} rad")
     print(f"  differential step norm: {np.linalg.norm(differential_step.delta_q):.3e} rad")
 
 

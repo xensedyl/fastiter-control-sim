@@ -13,32 +13,18 @@
 
 namespace fr3_control_sim {
 
-struct IKOptions {
-  int max_iterations = 1000;
-  int max_retries = 8;
-  double tolerance = 1e-5;
-  double damping = 1e-6;
-  double step_size = 0.7;
-  double max_step_norm = 0.25;
-  double posture_gain = 0.1;
-  int line_search_steps = 8;
-  unsigned int random_seed = 42;
-};
-
-struct IKResult {
+struct MinkIKResult {
   Eigen::VectorXd q;
   bool success = false;
   int iterations = 0;
-  int attempts = 0;
   double error = 0.0;
   double position_error = 0.0;
   double orientation_error = 0.0;
 };
 
-// Options for one Mink-style differential IK step.  Unlike IKOptions (which
-// configures the existing batch solver), these values describe a single
-// linearized QP solved at the current configuration.  All revolute quantities
-// are in radians and all translations are in meters.
+// Options for one Mink-style differential IK step.  These values describe a
+// single linearized QP solved at the current configuration.  All revolute
+// quantities are in radians and all translations are in meters.
 struct DifferentialIKOptions {
   double dt = 0.02;
   double damping = 1e-6;
@@ -114,24 +100,19 @@ public:
   std::map<std::string, Eigen::Matrix4d>
   frame_placements(const Eigen::VectorXd &q) const;
 
-  IKResult inverse_kinematics(const Eigen::Matrix4d &target,
-                              const Eigen::VectorXd &q_seed,
-                              const IKOptions &options = IKOptions()) const;
-
   // Solve one Mink-style differential IK/QP step.  The result contains the
   // tangent displacement delta_q, its velocity delta_q / dt, and the
-  // Pinocchio-integrated next configuration.  Call this method repeatedly for
-  // a closed-loop controller; it deliberately does not replace the existing
-  // one-shot inverse_kinematics() API.
+  // Pinocchio-integrated next configuration. Call this method repeatedly for
+  // a closed-loop controller.
   DifferentialIKResult differential_ik_step(
       const Eigen::VectorXd &q, const Eigen::Matrix4d &target,
       const DifferentialIKOptions &options = DifferentialIKOptions(),
       const std::string &frame_name = "") const;
 
-  // Convenience batch wrapper around repeated differential_ik_step() calls.
-  // This is the closest equivalent to Mink's examples, while the step API is
-  // intended for a real-time/control loop.
-  IKResult mink_inverse_kinematics(
+  // Convenience wrapper around repeated differential_ik_step() calls. This
+  // is useful for a finite target solve, while the step API is intended for a
+  // real-time/control loop.
+  MinkIKResult mink_inverse_kinematics(
       const Eigen::Matrix4d &target, const Eigen::VectorXd &q_seed,
       const DifferentialIKOptions &options = DifferentialIKOptions()) const;
 
@@ -161,13 +142,8 @@ private:
 
   void validate_configuration(const Eigen::VectorXd &q) const;
   pinocchio::FrameIndex resolve_frame(const std::string &frame_name) const;
-  Eigen::VectorXd clamp_configuration(const Eigen::VectorXd &q) const;
   ErrorState pose_error(const Eigen::VectorXd &q, const pinocchio::SE3 &target,
                         pinocchio::FrameIndex frame_id) const;
-  IKResult inverse_kinematics_once(const pinocchio::SE3 &target,
-                                   const Eigen::VectorXd &q_seed,
-                                   pinocchio::FrameIndex frame_id,
-                                   const IKOptions &options) const;
 };
 
 Eigen::Matrix4d pose_from_xyz_rpy(const Eigen::Vector3d &xyz,

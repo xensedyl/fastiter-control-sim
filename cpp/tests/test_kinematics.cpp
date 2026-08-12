@@ -92,11 +92,12 @@ int main() {
     require(position_step.next_q[0] <= limits[0].second + 1e-9,
             "Differential IK violated an upper position limit");
 
-    fr3_control_sim::IKOptions options;
-    options.max_iterations = 1500;
-    options.max_retries = 4;
-    options.tolerance = 1e-6;
-    const auto result = model.inverse_kinematics(target_pose, q_home, options);
+    fr3_control_sim::DifferentialIKOptions options;
+    options.max_iterations = 300;
+    options.tolerance = 1e-5;
+    options.posture_cost = 0.01;
+    const auto result =
+        model.mink_inverse_kinematics(target_pose, q_home, options);
     if (!result.success) {
       throw std::runtime_error("IK did not converge, error=" +
                                std::to_string(result.error));
@@ -111,8 +112,8 @@ int main() {
     }
 
     // FR3 is redundant: the same TCP pose can be reached with different elbow
-    // postures.  The null-space objective should recover the ready/home
-    // posture when solving the home target from a deliberately skewed seed.
+    // postures. Mink's soft PostureTask should recover the ready/home posture
+    // when solving the home target from a deliberately skewed seed.
     Eigen::VectorXd q_skewed(7);
     q_skewed << -27.75, -48.05, 17.44, -134.54, 12.89, 87.89, 29.59;
     q_skewed *= M_PI / 180.0;
@@ -120,12 +121,13 @@ int main() {
         fr3_control_sim::pose_from_xyz_rpy(
             Eigen::Vector3d(0.3069, 0.0, 0.4869),
             Eigen::Vector3d(-3.1416, 0.0, 0.0));
-    fr3_control_sim::IKOptions posture_options;
+    fr3_control_sim::DifferentialIKOptions posture_options;
     posture_options.max_iterations = 1000;
-    posture_options.max_retries = 0;
-    posture_options.posture_gain = 0.1;
+    posture_options.posture_cost = 0.01;
+    posture_options.posture_gain = 1.0;
     const auto posture_result =
-        model.inverse_kinematics(near_home_target, q_skewed, posture_options);
+        model.mink_inverse_kinematics(near_home_target, q_skewed,
+                                      posture_options);
     if (!posture_result.success) {
       throw std::runtime_error("Null-space posture IK did not converge");
     }
@@ -168,15 +170,23 @@ int main() {
       throw std::runtime_error("Minimum-jerk trajectory endpoints are invalid");
     }
 
-    options.max_retries = 8;
+    // Differential IK is local by design; it is not expected to find every
+    // globally reachable branch from an arbitrary seed.  Exercise a set of
+    // nearby targets instead of turning this test into a global batch-IK
+    // regression.
     for (unsigned int seed = 1000; seed < 1020; ++seed) {
+      const Eigen::VectorXd q_near =
+          q_home + 0.03 *
+                       Eigen::VectorXd::NullaryExpr(7, [seed](int index) {
+                         return std::sin(static_cast<double>(seed + index));
+                       });
       const Eigen::Matrix4d reachable_pose =
-          model.forward_kinematics(model.random_configuration(seed));
-      const auto random_result =
-          model.inverse_kinematics(reachable_pose, q_home, options);
+          model.forward_kinematics(q_near);
+      const auto random_result = model.mink_inverse_kinematics(
+          reachable_pose, q_home, no_posture);
       if (!random_result.success) {
         throw std::runtime_error(
-            "IK random reachable-pose regression failed at seed " +
+            "Mink local reachable-pose regression failed at seed " +
             std::to_string(seed));
       }
     }
@@ -186,7 +196,7 @@ int main() {
               << "  home tcp xyz: "
               << home_pose.topRightCorner<3, 1>().transpose() << "\n"
               << "  IK error: " << result.error << "\n"
-              << "  random reachable IK: 20/20\n";
+              << "  nearby reachable Mink IK: 20/20\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FR3 C++ smoke test failed: " << error.what() << '\n';

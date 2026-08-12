@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fr3-control-sim"
 version = "0.1.0"
-description = "FR3 forward/inverse kinematics and MeshCat simulation backed by Pinocchio C++"
+description = "FR3 FK and Mink-style differential IK simulation backed by Pinocchio C++"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"

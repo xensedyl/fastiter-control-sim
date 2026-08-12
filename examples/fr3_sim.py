@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FR3 forward/inverse-kinematics and trajectory simulation."""
+"""FR3 FK, Mink differential IK, and trajectory simulation."""
 
 from __future__ import annotations
 
@@ -18,10 +18,8 @@ import fr3_control_sim as fr3
 DEFAULT_DESCRIPTION_ROOT = Path(
     os.environ.get("FRANKA_DESCRIPTION_ROOT", "/home/xense/fastiter/franka_description")
 )
-# Edit this value to change the default null-space home-posture constraint.
-# Set it to 0.0 to disable the constraint.  It can also be overridden with
-# the --posture-gain command-line option.
-DEFAULT_POSTURE_GAIN = 0.1
+DEFAULT_POSTURE_COST = 0.01
+DEFAULT_POSTURE_GAIN = 1.0
 
 
 def _arguments() -> argparse.Namespace:
@@ -58,12 +56,34 @@ def _arguments() -> argparse.Namespace:
         type=float,
         default=DEFAULT_POSTURE_GAIN,
         help=(
-            f"Null-space home-posture gain for IK (default: "
-            f"{DEFAULT_POSTURE_GAIN:g}; 0 disables the constraint)."
+            f"Mink PostureTask gain in [0, 1] (default: "
+            f"{DEFAULT_POSTURE_GAIN:g})."
         ),
     )
+    parser.add_argument(
+        "--posture-cost",
+        type=float,
+        default=DEFAULT_POSTURE_COST,
+        help=f"Mink PostureTask cost (default: {DEFAULT_POSTURE_COST:g}).",
+    )
+    parser.add_argument(
+        "--mink-steps",
+        type=int,
+        default=300,
+        help="External differential IK steps for each target (default: 300).",
+    )
+    parser.add_argument(
+        "--velocity-limits",
+        action="store_true",
+        help="Enforce FR3 velocity limits in the Mink QP.",
+    )
     parser.add_argument("--duration", type=float, default=2.0)
-    parser.add_argument("--dt", type=float, default=0.02)
+    parser.add_argument(
+        "--dt",
+        type=float,
+        default=0.02,
+        help="Mink/control and trajectory period in seconds (default: 0.02).",
+    )
     return parser.parse_args()
 
 
@@ -152,21 +172,36 @@ def _solve_ik(
     home: np.ndarray,
     target_values: list[float] | None,
     posture_gain: float = DEFAULT_POSTURE_GAIN,
+    posture_cost: float = DEFAULT_POSTURE_COST,
+    mink_steps: int = 300,
+    dt: float = 0.02,
+    velocity_limits: bool = False,
 ) -> np.ndarray:
     target = _make_target(model, home, target_values)
     _print_pose("target", target)
-    options = fr3.IKOptions()
-    if not np.isfinite(posture_gain) or posture_gain < 0.0:
-        raise ValueError("--posture-gain must be a finite non-negative number")
+    options = fr3.DifferentialIKOptions()
+    if not np.isfinite(posture_gain) or not 0.0 <= posture_gain <= 1.0:
+        raise ValueError("--posture-gain must be in [0, 1]")
+    if not np.isfinite(posture_cost) or posture_cost < 0.0:
+        raise ValueError("--posture-cost must be finite and non-negative")
+    if mink_steps <= 0:
+        raise ValueError("--mink-steps must be positive")
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError("--dt must be finite and positive")
+    options.max_iterations = int(mink_steps)
+    options.dt = float(dt)
+    options.posture_cost = float(posture_cost)
     options.posture_gain = float(posture_gain)
-    print(f"IK posture_gain (null-space): {options.posture_gain:.3f}")
-    result = model.inverse_kinematics(target, home, options)
-    error = getattr(result, "error", getattr(result, "residual", float("nan")))
-    iterations = getattr(result, "iterations", -1)
-    print(f"IK success={result.success} iterations={iterations} error={error:.3e}")
+    options.enforce_velocity_limits = bool(velocity_limits)
+    print(
+        f"Mink IK posture_cost={options.posture_cost:.3g} "
+        f"posture_gain={options.posture_gain:.3g} steps={options.max_iterations}"
+    )
+    result = model.mink_inverse_kinematics(target, home, options)
+    print(f"Mink IK success={result.success} iterations={result.iterations} error={result.error:.3e}")
     print(f"q [deg]: {np.array2string(np.degrees(result.q), precision=2)}")
     if not result.success:
-        raise RuntimeError("inverse kinematics did not converge")
+        raise RuntimeError("Mink differential IK did not converge")
     solved = np.asarray(result.q, dtype=float)
     _print_pose("solved", model.forward_kinematics(solved))
     return solved
@@ -230,19 +265,30 @@ def _interactive_ik(
     duration: float,
     dt: float,
     posture_gain: float = DEFAULT_POSTURE_GAIN,
+    posture_cost: float = DEFAULT_POSTURE_COST,
+    mink_steps: int = 300,
+    velocity_limits: bool = False,
 ) -> None:
     current = home.copy()
-    options = fr3.IKOptions()
-    if not np.isfinite(posture_gain) or posture_gain < 0.0:
-        raise ValueError("--posture-gain must be a finite non-negative number")
+    options = fr3.DifferentialIKOptions()
+    if not np.isfinite(posture_gain) or not 0.0 <= posture_gain <= 1.0:
+        raise ValueError("--posture-gain must be in [0, 1]")
+    if not np.isfinite(posture_cost) or posture_cost < 0.0:
+        raise ValueError("--posture-cost must be finite and non-negative")
+    if mink_steps <= 0:
+        raise ValueError("--mink-steps must be positive")
+    options.max_iterations = int(mink_steps)
+    options.dt = float(dt)
+    options.posture_cost = float(posture_cost)
     options.posture_gain = float(posture_gain)
+    options.enforce_velocity_limits = bool(velocity_limits)
     if visualizer is not None:
         visualizer.update(current)
 
     print("\nInteractive IK: input a target pose.")
     print(
-        f"  posture_gain (null-space): {options.posture_gain:.3f} "
-        "(set with --posture-gain; 0 disables)"
+        f"  Mink PostureTask: cost={options.posture_cost:.3g}, "
+        f"gain={options.posture_gain:.3g}, steps={options.max_iterations}"
     )
     print("  x y z                    (meters; keep current orientation)")
     print("  x y z roll pitch yaw     (meters + radians)")
@@ -281,11 +327,11 @@ def _interactive_ik(
             continue
 
         target = _make_target(model, current, values)
-        result = model.inverse_kinematics(target, current, options)
+        result = model.mink_inverse_kinematics(target, current, options)
         status = "converged" if result.success else "not converged"
         print(
-            f"  [{status}] iterations={result.iterations} "
-            f"attempts={result.attempts} error={result.error:.3e}"
+            f"  [{status}] Mink steps={result.iterations} "
+            f"error={result.error:.3e}"
         )
         print(f"  q [deg]: {np.array2string(np.degrees(result.q), precision=2)}")
         if not result.success:
@@ -314,7 +360,7 @@ def _interactive_ik(
 
 def main() -> None:
     args = _arguments()
-    if args.duration <= 0.0 or args.dt <= 0.0:
+    if args.duration <= 0.0 or args.dt <= 0.0 or args.mink_steps <= 0:
         raise ValueError("--duration and --dt must be positive")
 
     description_root = args.description_root.expanduser().resolve()
@@ -324,7 +370,11 @@ def main() -> None:
     print(f"URDF: {urdf_path}")
     print(f"end effector: {model.end_effector_frame}")
     print(f"joints ({model.nq}): {', '.join(model.joint_names)}")
-    print(f"IK posture_gain (null-space): {args.posture_gain:g}")
+    print(
+        f"Mink IK: posture_cost={args.posture_cost:g}, "
+        f"posture_gain={args.posture_gain:g}, steps={args.mink_steps}, "
+        f"velocity_limits={args.velocity_limits}"
+    )
 
     visualizer = None
     if not args.headless:
@@ -349,13 +399,25 @@ def main() -> None:
             args.duration,
             args.dt,
             args.posture_gain,
+            args.posture_cost,
+            args.mink_steps,
+            args.velocity_limits,
         )
         return
 
     if args.mode == "fk":
         q_goal = _run_fk(model, home, args.q)
     else:
-        q_goal = _solve_ik(model, home, args.target, args.posture_gain)
+        q_goal = _solve_ik(
+            model,
+            home,
+            args.target,
+            args.posture_gain,
+            args.posture_cost,
+            args.mink_steps,
+            args.dt,
+            args.velocity_limits,
+        )
 
     if args.mode == "demo":
         _print_pose("home", model.forward_kinematics(home))

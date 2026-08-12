@@ -3,18 +3,16 @@
 from ._fr3_sim import (
     DifferentialIKOptions,
     DifferentialIKResult,
-    IKOptions,
-    IKResult,
+    MinkIKResult,
     RobotModel,
     pose_from_xyz_rpy,
     rpy_from_pose,
 )
 
 __all__ = [
-    "IKOptions",
-    "IKResult",
     "DifferentialIKOptions",
     "DifferentialIKResult",
+    "MinkIKResult",
     "RobotModel",
     "pose_from_xyz_rpy",
     "rpy_from_pose",

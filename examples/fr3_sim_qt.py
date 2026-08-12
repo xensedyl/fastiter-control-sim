@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qt slider control panel for the FR3 Pinocchio C++ simulation."""
+"""Qt slider control panel for the FR3 Mink-style differential IK demo."""
 
 from __future__ import annotations
 
@@ -18,10 +18,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DESCRIPTION_ROOT = Path(
     os.environ.get("FRANKA_DESCRIPTION_ROOT", "/home/xense/fastiter/franka_description")
 )
-# Edit this value to change the default null-space home-posture constraint.
-# Set it to 0.0 to disable the constraint.  It can also be overridden with
-# the --posture-gain command-line option or the IK-tab spin box.
-DEFAULT_POSTURE_GAIN = float(fr3.IKOptions().posture_gain)
+_DEFAULT_MINK_OPTIONS = fr3.DifferentialIKOptions()
+DEFAULT_POSTURE_COST = 0.01
+DEFAULT_POSTURE_GAIN = float(_DEFAULT_MINK_OPTIONS.posture_gain)
+DEFAULT_MINK_STEPS = int(_DEFAULT_MINK_OPTIONS.max_iterations)
+DEFAULT_MINK_DT = float(_DEFAULT_MINK_OPTIONS.dt)
 
 try:
     from PySide6.QtCore import QSignalBlocker, Qt, QTimer, QUrl, Signal
@@ -36,6 +37,8 @@ try:
         QMessageBox,
         QPushButton,
         QSlider,
+        QSpinBox,
+        QCheckBox,
         QTabWidget,
         QVBoxLayout,
         QWidget,
@@ -166,6 +169,10 @@ class Fr3SimWindow(QMainWindow):
         *,
         initial_mode: str = "fk",
         posture_gain: float = DEFAULT_POSTURE_GAIN,
+        posture_cost: float = DEFAULT_POSTURE_COST,
+        mink_steps: int = DEFAULT_MINK_STEPS,
+        dt: float = DEFAULT_MINK_DT,
+        velocity_limits: bool = False,
     ) -> None:
         super().__init__()
         self.model = model
@@ -173,10 +180,21 @@ class Fr3SimWindow(QMainWindow):
         self.urdf_path = urdf_path
         self.home_q = np.asarray(model.home_configuration(), dtype=float)
         self.current_q = self.home_q.copy()
-        self.ik_options = fr3.IKOptions()
-        if not np.isfinite(posture_gain) or posture_gain < 0.0:
-            raise ValueError("--posture-gain must be a finite non-negative number")
+        self.ik_options = fr3.DifferentialIKOptions()
+        if not np.isfinite(posture_gain) or not 0.0 <= posture_gain <= 1.0:
+            raise ValueError("--posture-gain must be finite and in [0, 1]")
+        if not np.isfinite(posture_cost) or posture_cost < 0.0:
+            raise ValueError("--posture-cost must be finite and non-negative")
+        if int(mink_steps) <= 0:
+            raise ValueError("--mink-steps must be positive")
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError("--dt must be finite and positive")
         self.ik_options.posture_gain = float(posture_gain)
+        self.ik_options.posture_cost = float(posture_cost)
+        self.ik_options.max_iterations = int(mink_steps)
+        self.ik_options.dt = float(dt)
+        self.ik_options.enforce_velocity_limits = bool(velocity_limits)
+        self.velocity_limits_enabled = bool(velocity_limits)
         self._syncing_controls = False
 
         self.fk_timer = QTimer(self)
@@ -189,8 +207,8 @@ class Fr3SimWindow(QMainWindow):
         self.ik_timer.setInterval(80)
         self.ik_timer.timeout.connect(self._solve_ik)
 
-        self.setWindowTitle("FR3 Pinocchio FK / IK Control")
-        self.resize(100, 300)
+        self.setWindowTitle("FR3 Mink Differential IK Control")
+        self.resize(900, 700)
         self._build_ui()
         self._reset_home()
         self.tabs.setCurrentIndex(0 if initial_mode == "fk" else 1)
@@ -201,7 +219,7 @@ class Fr3SimWindow(QMainWindow):
         root_layout.setContentsMargins(16, 14, 16, 14)
         root_layout.setSpacing(10)
 
-        title = QLabel("FR3 Pinocchio C++ FK / IK")
+        title = QLabel("FR3 C++ FK / Mink Differential IK")
         title.setStyleSheet("font-size: 20px; font-weight: 600;")
         root_layout.addWidget(title)
         root_layout.addWidget(QLabel(f"URDF: {self.urdf_path}"))
@@ -311,21 +329,68 @@ class Fr3SimWindow(QMainWindow):
             group_layout.addWidget(control)
         layout.addWidget(group)
 
-        options_group = QGroupBox("IK options")
+        options_group = QGroupBox("Mink IK options")
         options_layout = QHBoxLayout(options_group)
-        options_layout.addWidget(QLabel("posture_gain (null-space):"))
+
+        options_layout.addWidget(QLabel("posture_cost:"))
+        self.posture_cost_spin_box = QDoubleSpinBox()
+        self.posture_cost_spin_box.setRange(0.0, 10.0)
+        self.posture_cost_spin_box.setDecimals(5)
+        self.posture_cost_spin_box.setSingleStep(0.001)
+        self.posture_cost_spin_box.setValue(float(self.ik_options.posture_cost))
+        self.posture_cost_spin_box.setToolTip(
+            "Soft Mink PostureTask cost; zero disables the posture task."
+        )
+        self.posture_cost_spin_box.valueChanged.connect(
+            self._on_posture_cost_changed
+        )
+        options_layout.addWidget(self.posture_cost_spin_box)
+
+        options_layout.addWidget(QLabel("posture_gain:"))
         self.posture_gain_spin_box = QDoubleSpinBox()
-        self.posture_gain_spin_box.setRange(0.0, 10.0)
+        self.posture_gain_spin_box.setRange(0.0, 1.0)
         self.posture_gain_spin_box.setDecimals(3)
         self.posture_gain_spin_box.setSingleStep(0.01)
         self.posture_gain_spin_box.setValue(float(self.ik_options.posture_gain))
         self.posture_gain_spin_box.setToolTip(
-            "Home-posture attraction in the Jacobian null space; 0 disables it."
+            "Mink task gain in [0, 1]. It scales the posture correction."
         )
         self.posture_gain_spin_box.valueChanged.connect(
             self._on_posture_gain_changed
         )
         options_layout.addWidget(self.posture_gain_spin_box)
+
+        options_layout.addWidget(QLabel("steps:"))
+        self.mink_steps_spin_box = QSpinBox()
+        self.mink_steps_spin_box.setRange(1, 10000)
+        self.mink_steps_spin_box.setSingleStep(10)
+        self.mink_steps_spin_box.setValue(int(self.ik_options.max_iterations))
+        self.mink_steps_spin_box.setToolTip(
+            "Number of external Mink differential IK steps."
+        )
+        self.mink_steps_spin_box.valueChanged.connect(self._on_mink_steps_changed)
+        options_layout.addWidget(self.mink_steps_spin_box)
+
+        options_layout.addWidget(QLabel("dt:"))
+        self.dt_spin_box = QDoubleSpinBox()
+        self.dt_spin_box.setRange(1e-4, 1.0)
+        self.dt_spin_box.setDecimals(4)
+        self.dt_spin_box.setSingleStep(0.001)
+        self.dt_spin_box.setValue(float(self.ik_options.dt))
+        self.dt_spin_box.setSuffix(" s")
+        self.dt_spin_box.setToolTip("Mink differential IK integration period.")
+        self.dt_spin_box.valueChanged.connect(self._on_dt_changed)
+        options_layout.addWidget(self.dt_spin_box)
+
+        self.velocity_limits_check = QCheckBox("velocity limits")
+        self.velocity_limits_check.setChecked(self.velocity_limits_enabled)
+        self.velocity_limits_check.setToolTip(
+            "Add FR3 joint velocity bounds to the Mink box QP."
+        )
+        self.velocity_limits_check.toggled.connect(
+            self._on_velocity_limits_changed
+        )
+        options_layout.addWidget(self.velocity_limits_check)
         options_layout.addStretch(1)
         layout.addWidget(options_group)
 
@@ -346,8 +411,21 @@ class Fr3SimWindow(QMainWindow):
         layout.addStretch(1)
         return page
 
+    def _on_posture_cost_changed(self, value: float) -> None:
+        """Apply a new Mink PostureTask cost and re-solve the target."""
+        if self._syncing_controls:
+            return
+        self.ik_options.posture_cost = float(value)
+        self.ik_status.setText(
+            f"posture_cost = {self.ik_options.posture_cost:.5f}\n"
+            "Mink option updated; solving..."
+        )
+        self.ik_status.setStyleSheet("font-family: monospace; color: #b36b00;")
+        if self.tabs.currentIndex() == 1:
+            self._schedule_ik(value)
+
     def _on_posture_gain_changed(self, value: float) -> None:
-        """Apply a new null-space gain and re-solve the current IK target."""
+        """Apply a new Mink task gain and re-solve the current target."""
         if self._syncing_controls:
             return
         self.ik_options.posture_gain = float(value)
@@ -358,6 +436,28 @@ class Fr3SimWindow(QMainWindow):
         self.ik_status.setStyleSheet("font-family: monospace; color: #b36b00;")
         if self.tabs.currentIndex() == 1:
             self._schedule_ik(value)
+
+    def _on_mink_steps_changed(self, value: int) -> None:
+        if self._syncing_controls:
+            return
+        self.ik_options.max_iterations = int(value)
+        if self.tabs.currentIndex() == 1:
+            self._schedule_ik(float(value))
+
+    def _on_dt_changed(self, value: float) -> None:
+        if self._syncing_controls:
+            return
+        self.ik_options.dt = float(value)
+        if self.tabs.currentIndex() == 1:
+            self._schedule_ik(value)
+
+    def _on_velocity_limits_changed(self, enabled: bool) -> None:
+        if self._syncing_controls:
+            return
+        self.velocity_limits_enabled = bool(enabled)
+        self.ik_options.enforce_velocity_limits = bool(enabled)
+        if self.tabs.currentIndex() == 1:
+            self._schedule_ik(1.0 if enabled else 0.0)
 
     @staticmethod
     def _pose_text(pose: Sequence[Sequence[float]]) -> str:
@@ -445,14 +545,15 @@ class Fr3SimWindow(QMainWindow):
         self.ik_timer.stop()
         try:
             target = self._target_pose()
-            result = self.model.inverse_kinematics(
+            result = self.model.mink_inverse_kinematics(
                 target, self.current_q, self.ik_options
             )
             if not result.success:
                 self.ik_status.setText(
-                    "IK not converged\n"
+                    "Mink IK not converged\n"
+                    f"posture_cost={self.ik_options.posture_cost:.5f} "
                     f"posture_gain={self.ik_options.posture_gain:.3f}\n"
-                    f"iterations={result.iterations} attempts={result.attempts} "
+                    f"iterations={result.iterations} "
                     f"error={result.error:.3e}\n"
                     f"position_error={result.position_error:.3e} "
                     f"orientation_error={result.orientation_error:.3e}"
@@ -470,9 +571,10 @@ class Fr3SimWindow(QMainWindow):
                 self.model.forward_kinematics(solved), dtype=float
             )
             self.ik_status.setText(
-                "IK converged\n"
+                "Mink IK converged\n"
+                f"posture_cost={self.ik_options.posture_cost:.5f} "
                 f"posture_gain={self.ik_options.posture_gain:.3f}\n"
-                f"iterations={result.iterations} attempts={result.attempts} "
+                f"iterations={result.iterations} "
                 f"error={result.error:.3e}\n"
                 f"q [deg] = {np.array2string(np.degrees(solved), precision=2)}\n"
                 + self._pose_text(solved_pose)
@@ -553,9 +655,31 @@ def _arguments() -> argparse.Namespace:
         type=float,
         default=DEFAULT_POSTURE_GAIN,
         help=(
-            f"Null-space home-posture gain for IK (default: {DEFAULT_POSTURE_GAIN:g}; "
-            "0 disables the constraint)."
+            f"Mink PostureTask gain in [0, 1] (default: {DEFAULT_POSTURE_GAIN:g})."
         ),
+    )
+    parser.add_argument(
+        "--posture-cost",
+        type=float,
+        default=DEFAULT_POSTURE_COST,
+        help=f"Mink PostureTask cost (default: {DEFAULT_POSTURE_COST:g}).",
+    )
+    parser.add_argument(
+        "--mink-steps",
+        type=int,
+        default=DEFAULT_MINK_STEPS,
+        help=f"External Mink differential IK steps (default: {DEFAULT_MINK_STEPS}).",
+    )
+    parser.add_argument(
+        "--dt",
+        type=float,
+        default=DEFAULT_MINK_DT,
+        help=f"Mink integration period in seconds (default: {DEFAULT_MINK_DT:g}).",
+    )
+    parser.add_argument(
+        "--velocity-limits",
+        action="store_true",
+        help="Enforce FR3 joint velocity limits in the Mink QP.",
     )
     return parser.parse_args()
 
@@ -565,7 +689,13 @@ def main() -> int:
     description_root = args.description_root.expanduser().resolve()
     urdf_path = _resolve_urdf(args.urdf, description_root)
     model = fr3.RobotModel(str(urdf_path))
-    print(f"IK posture_gain (null-space): {args.posture_gain:g}")
+    print(
+        "Mink IK: "
+        f"posture_cost={args.posture_cost:g}, "
+        f"posture_gain={args.posture_gain:g}, "
+        f"steps={args.mink_steps}, dt={args.dt:g}, "
+        f"velocity_limits={args.velocity_limits}"
+    )
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("FR3 Control Sim")
@@ -588,6 +718,10 @@ def main() -> int:
         urdf_path,
         initial_mode=args.mode,
         posture_gain=args.posture_gain,
+        posture_cost=args.posture_cost,
+        mink_steps=args.mink_steps,
+        dt=args.dt,
+        velocity_limits=args.velocity_limits,
     )
     window.show()
     return app.exec()

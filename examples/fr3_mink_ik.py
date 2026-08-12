@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Run the native C++ Mink-style differential IK loop for the FR3.
 
-Unlike ``RobotModel.inverse_kinematics()``, ``differential_ik_step()`` solves
-one local weighted QP and returns a tangent displacement/velocity.  This
-example deliberately performs the outer integration loop in Python, just as a
-controller would do; all FK, Jacobians, task assembly, and the box-QP solve
-remain in C++.
+``differential_ik_step()`` solves one local weighted QP and returns a tangent
+displacement/velocity. This example deliberately performs the outer
+integration loop in Python, just as a controller would do; all FK, Jacobians,
+task assembly, and the box-QP solve remain in C++.
 """
 
 from __future__ import annotations
