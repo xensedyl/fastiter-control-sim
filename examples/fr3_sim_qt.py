@@ -19,10 +19,20 @@ DEFAULT_DESCRIPTION_ROOT = Path(
     os.environ.get("FRANKA_DESCRIPTION_ROOT", "/home/xense/fastiter/franka_description")
 )
 _DEFAULT_MINK_OPTIONS = fr3.DifferentialIKOptions()
-DEFAULT_POSTURE_COST = 0.01
+# Mink's PostureTask is a soft task in the same QP as the frame task.  A cost
+# of 0.01 is strong enough to leave a visible Cartesian residual for many FR3
+# poses.  Keep a small elbow/home preference by default without overwhelming
+# the XYZ/RPY slider target.
+DEFAULT_POSTURE_COST = 0.001
 DEFAULT_POSTURE_GAIN = float(_DEFAULT_MINK_OPTIONS.posture_gain)
 DEFAULT_MINK_STEPS = int(_DEFAULT_MINK_OPTIONS.max_iterations)
 DEFAULT_MINK_DT = float(_DEFAULT_MINK_OPTIONS.dt)
+IK_POSITION_TOLERANCE = 1e-4
+IK_ORIENTATION_TOLERANCE = 1e-4
+IK_CONTINUATION_MAX_TRANSLATION = 0.01
+IK_CONTINUATION_MAX_ROTATION = math.radians(2.0)
+IK_CONTINUATION_MAX_SEGMENTS = 200
+IK_TRACKING_FRAME_GAIN = 0.7
 
 try:
     from PySide6.QtCore import QSignalBlocker, Qt, QTimer, QUrl, Signal
@@ -298,7 +308,8 @@ class Fr3SimWindow(QMainWindow):
 
         description = QLabel(
             "Drag x/y/z in meters and roll/pitch/yaw in radians. "
-            "IK is solved from the last successful configuration."
+            "The target is followed continuously from the current pose. "
+            "Red status can also mean that the pose is outside the FR3 workspace."
         )
         description.setWordWrap(True)
         layout.addWidget(description)
@@ -504,6 +515,104 @@ class Fr3SimWindow(QMainWindow):
         )
         return np.asarray(fr3.pose_from_xyz_rpy(xyz, rpy), dtype=float)
 
+    @staticmethod
+    def _rotation_angle(first: np.ndarray, second: np.ndarray) -> float:
+        """Return the shortest SO(3) angle between two pose matrices."""
+        relative = first[:3, :3].T @ second[:3, :3]
+        cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
+        return math.acos(cosine)
+
+    def _continuation_targets(
+        self, start: np.ndarray, target: np.ndarray
+    ) -> list[np.ndarray]:
+        """Split a slider jump into small SE(3) targets for local Mink IK."""
+        translation_distance = float(
+            np.linalg.norm(target[:3, 3] - start[:3, 3])
+        )
+        rotation_distance = self._rotation_angle(start, target)
+        segments = max(
+            1,
+            int(math.ceil(translation_distance / IK_CONTINUATION_MAX_TRANSLATION)),
+            int(math.ceil(rotation_distance / IK_CONTINUATION_MAX_ROTATION)),
+        )
+        segments = min(segments, IK_CONTINUATION_MAX_SEGMENTS)
+        start_rpy = np.asarray(fr3.rpy_from_pose(start), dtype=float)
+        target_rpy = np.asarray(fr3.rpy_from_pose(target), dtype=float)
+        rpy_delta = (target_rpy - start_rpy + math.pi) % (2.0 * math.pi) - math.pi
+
+        targets: list[np.ndarray] = []
+        for index in range(1, segments + 1):
+            ratio = index / segments
+            xyz = (1.0 - ratio) * start[:3, 3] + ratio * target[:3, 3]
+            rpy = start_rpy + ratio * rpy_delta
+            targets.append(
+                np.asarray(fr3.pose_from_xyz_rpy(xyz, rpy), dtype=float)
+            )
+        return targets
+
+    def _frame_target_reached(self, result: object) -> bool:
+        """Judge the frame task, independently of the soft PostureTask."""
+        q = np.asarray(result.q, dtype=float)
+        position_error = float(result.position_error)
+        orientation_error = float(result.orientation_error)
+        return (
+            np.isfinite(q).all()
+            and math.isfinite(position_error)
+            and math.isfinite(orientation_error)
+            and position_error <= IK_POSITION_TOLERANCE
+            and orientation_error <= IK_ORIENTATION_TOLERANCE
+        )
+
+    @staticmethod
+    def _copy_ik_options(source: object) -> object:
+        """Copy pybind options without sharing mutable Eigen arrays.
+
+        The slider controller uses a frame-only option set while it follows a
+        large target jump.  The optional PostureTask is applied only after the
+        Cartesian target has been reached, so a soft posture objective cannot
+        strand the end-effector halfway through a drag.
+        """
+        copied = fr3.DifferentialIKOptions()
+        scalar_fields = (
+            "dt",
+            "damping",
+            "qp_max_active_sets",
+            "qp_tolerance",
+            "frame_gain",
+            "frame_lm_damping",
+            "posture_cost",
+            "posture_gain",
+            "posture_lm_damping",
+            "enforce_position_limits",
+            "position_limit_gain",
+            "enforce_velocity_limits",
+            "max_iterations",
+            "tolerance",
+        )
+        vector_fields = (
+            "position_cost",
+            "orientation_cost",
+            "posture_costs",
+            "posture_target",
+            "velocity_limits",
+        )
+        for field in scalar_fields:
+            setattr(copied, field, getattr(source, field))
+        for field in vector_fields:
+            setattr(
+                copied,
+                field,
+                np.array(getattr(source, field), dtype=float, copy=True),
+            )
+        return copied
+
+    def _posture_task_enabled(self) -> bool:
+        costs = np.asarray(self.ik_options.posture_costs, dtype=float)
+        return self.ik_options.posture_gain > 0.0 and (
+            self.ik_options.posture_cost > 0.0
+            or (costs.size > 0 and float(np.max(costs)) > 0.0)
+        )
+
     def _set_fk_controls(self, q: np.ndarray) -> None:
         self._syncing_controls = True
         try:
@@ -545,25 +654,82 @@ class Fr3SimWindow(QMainWindow):
         self.ik_timer.stop()
         try:
             target = self._target_pose()
-            result = self.model.mink_inverse_kinematics(
-                target, self.current_q, self.ik_options
+            start_pose = np.asarray(
+                self.model.forward_kinematics(self.current_q), dtype=float
             )
-            if not result.success:
+            continuation_targets = self._continuation_targets(start_pose, target)
+            candidate_q = self.current_q.copy()
+            result = None
+            completed_segments = 0
+            # Follow the Cartesian target with only the FrameTask.  Mink's
+            # PostureTask is a soft objective and is intentionally deferred to
+            # the final target; otherwise it can trade a visible pose error
+            # for a preferred elbow configuration during a slider drag.
+            tracking_options = self._copy_ik_options(self.ik_options)
+            tracking_options.posture_cost = 0.0
+            tracking_options.posture_costs = np.empty(0, dtype=float)
+            tracking_options.posture_gain = 0.0
+            tracking_options.frame_gain = min(
+                float(tracking_options.frame_gain), IK_TRACKING_FRAME_GAIN
+            )
+            for continuation_target in continuation_targets:
+                result = self.model.mink_inverse_kinematics(
+                    continuation_target, candidate_q, tracking_options
+                )
+                if not self._frame_target_reached(result):
+                    break
+                candidate_q = np.asarray(result.q, dtype=float)
+                completed_segments += 1
+
+            if result is None:
+                raise RuntimeError("internal error: no IK continuation target")
+
+            frame_reached = (
+                completed_segments == len(continuation_targets)
+                and self._frame_target_reached(result)
+            )
+            if not frame_reached:
+                # Keep every continuation segment that was solved.  Without
+                # this, one unreachable/failing sub-target resets the next
+                # slider event to the old seed and the interactive controller
+                # can never make incremental progress.
+                if completed_segments > 0:
+                    self.current_q = candidate_q
+                    self._set_fk_controls(candidate_q)
+                    self._update_visualizer(candidate_q)
+                reached_pose = np.asarray(
+                    self.model.forward_kinematics(candidate_q), dtype=float
+                )
                 self.ik_status.setText(
-                    "Mink IK not converged\n"
+                    "Mink IK target not reached\n"
                     f"posture_cost={self.ik_options.posture_cost:.5f} "
                     f"posture_gain={self.ik_options.posture_gain:.3f}\n"
+                    f"continuation={completed_segments}/"
+                    f"{len(continuation_targets)} "
                     f"iterations={result.iterations} "
                     f"error={result.error:.3e}\n"
                     f"position_error={result.position_error:.3e} "
-                    f"orientation_error={result.orientation_error:.3e}"
+                    f"orientation_error={result.orientation_error:.3e}\n"
+                    f"last reachable pose:\n{self._pose_text(reached_pose)}\n"
+                    "The target may be outside the workspace or on a singular "
+                    "branch. Move the slider toward the last green pose."
                 )
                 self.ik_status.setStyleSheet(
                     "font-family: monospace; color: #b00020;"
                 )
                 return
 
-            solved = np.asarray(result.q, dtype=float)
+            posture_refined = False
+            if self._posture_task_enabled():
+                refinement = self.model.mink_inverse_kinematics(
+                    target, candidate_q, self.ik_options
+                )
+                if self._frame_target_reached(refinement):
+                    candidate_q = np.asarray(refinement.q, dtype=float)
+                    result = refinement
+                    posture_refined = True
+
+            solved = candidate_q
             self.current_q = solved
             self._set_fk_controls(solved)
             self._update_visualizer(solved)
@@ -571,9 +737,13 @@ class Fr3SimWindow(QMainWindow):
                 self.model.forward_kinematics(solved), dtype=float
             )
             self.ik_status.setText(
-                "Mink IK converged\n"
+                "Mink IK target reached"
+                + (" (posture refined)" if posture_refined else "")
+                + "\n"
                 f"posture_cost={self.ik_options.posture_cost:.5f} "
                 f"posture_gain={self.ik_options.posture_gain:.3f}\n"
+                f"continuation={len(continuation_targets)}/"
+                f"{len(continuation_targets)} "
                 f"iterations={result.iterations} "
                 f"error={result.error:.3e}\n"
                 f"q [deg] = {np.array2string(np.degrees(solved), precision=2)}\n"

@@ -18,7 +18,9 @@ import fr3_control_sim as fr3
 DEFAULT_DESCRIPTION_ROOT = Path(
     os.environ.get("FRANKA_DESCRIPTION_ROOT", "/home/xense/fastiter/franka_description")
 )
-DEFAULT_POSTURE_COST = 0.01
+# Keep the soft PostureTask weaker than the Cartesian FrameTask.  A larger
+# value can leave a visible pose residual on otherwise reachable targets.
+DEFAULT_POSTURE_COST = 0.001
 DEFAULT_POSTURE_GAIN = 1.0
 
 

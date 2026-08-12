@@ -60,7 +60,7 @@ cd fastiter-control-sim
 
 mamba env create -f environment.yml
 mamba activate fr3sim
-pip install -e .
+python -m pip install -e .
 ```
 
 `environment.yml` 已包含全部 mamba 依赖，因此不需要再单独执行 `mamba install`。它还会在激活环境时清除继承自系统 ROS 的 `PYTHONPATH` 和 `AMENT_PREFIX_PATH`，防止 pip 错把 `/opt/ros` 中属于另一个 Python 版本的包当成当前环境的包。
@@ -71,7 +71,7 @@ pip install -e .
 mamba env update -n fr3sim -f environment.yml
 mamba deactivate
 mamba activate fr3sim
-pip install -e .
+python -m pip install -e .
 ```
 
 ### 方案二：手动创建环境
@@ -115,19 +115,33 @@ export PYTHONNOUSERSITE=1
 
 5. 自动运行 CMake、编译 C++ 并 editable 安装
 ```bash
-pip install -e .
+python -m pip install -e .
 ```
+
+安装前请确认 pip 和 CMake 使用的是同一个 `fr3sim` 环境，而不是 base 环境：
+
+```bash
+which python
+python --version
+echo "$CONDA_PREFIX"
+python -m pip install -e . --no-build-isolation
+```
+
+`which python` 应指向 `$CONDA_PREFIX/bin/python`。`--no-build-isolation` 会直接使用
+当前环境里的 pybind11、Pinocchio 和 CMake，避免构建临时环境时误选系统的
+`/usr/local` Pinocchio。若上面的安装已经成功，后续只修改 `examples/` 或
+`README.md` 不需要再次安装；修改 `cpp/` 后再执行同一条命令重新编译扩展。
 
 需要查看完整 CMake 编译输出时使用：
 
 ```bash
-pip install -v -e .
+python -m pip install -v -e .
 ```
 
 如果不能访问 PyPI，但 mamba 环境中已经安装了 setuptools、wheel 和 pybind11，可以关闭 pip 构建隔离：
 
 ```bash
-pip install -v -e . --no-build-isolation
+python -m pip install -v -e . --no-build-isolation
 ```
 
 ## editable 安装说明
@@ -142,7 +156,7 @@ pip install -v -e . --no-build-isolation
 修改 Python 文件后会立即生效。修改 C++ 文件后，需要重新编译：
 
 ```bash
-pip install -e .
+python -m pip install -e .
 ```
 
 非 editable 安装使用：
@@ -276,7 +290,7 @@ IK 步数：
 ```bash
 python examples/fr3_sim.py --mode ik \
   --target 0.35 0.10 0.45 \
-  --posture-cost 0.01 \
+  --posture-cost 0.001 \
   --posture-gain 1.0 \
   --mink-steps 300
 ```
@@ -286,7 +300,7 @@ python examples/fr3_sim.py --mode ik \
 ```bash
 python examples/fr3_sim.py --mode ik \
   --target 0.35 0.10 0.45 \
-  --posture-cost 0.01 --velocity-limits
+  --posture-cost 0.001 --velocity-limits
 ```
 
 IK 成功后，C++ 会生成 50 Hz 最小加加速度关节轨迹，并由 MeshCat 播放。
@@ -314,10 +328,20 @@ python examples/fr3_sim_qt.py
 
 - `FK - Joint sliders`：拖动 `joint1` 到 `joint7`，单位为度；范围直接来自 C++ 模型中的关节限位。
 - `IK - XYZ / RPY sliders`：拖动 `x/y/z`（米）和 `roll/pitch/yaw`（弧度），停止拖动约 80 ms 后调用 C++ IK。
+  大的滑条跳变会被拆成小的位姿段，逐段调用 Mink FrameTask；这样局部微分 IK
+  不会因为一次跳得太远而立即失效。
 - IK 页签中的 Mink 参数 `posture_cost`、`posture_gain`、`steps`、`dt` 和
   `velocity limits` 可直接编辑；改动后会自动重新求解。
 
-IK 页签以上一次成功解作为下一次求解初值。不可达目标会显示红色错误信息，并保持机器人上一次成功姿态不变。
+IK 页签以上一次成功解作为下一次求解初值。拖动过程中已经成功的中间段会立即保留；
+如果最终目标不可达，机器人停在最后一个可达姿态，并在状态区显示该姿态及
+“已完成段数/总段数”。
+默认 `posture_cost=0.001`，比末端任务弱；设为 `0` 可关闭肘部/home 偏置，通常更容易
+覆盖较大的工作空间。红色状态仍表示目标在当前姿态约束下未达到，而不是程序崩溃。
+
+如果拖动到红色状态，先点击 `Reset Home`，再把 `posture_cost` 调到 `0` 并逐步移动
+滑条。FR3 的可达空间还会随目标方向和关节限位变化；Mink 是局部 differential IK，
+不能保证从每个肘部分支直接跳到所有数学上可达的目标。
 
 默认打开 FK 页签；直接打开 IK 页签：
 
@@ -329,7 +353,7 @@ python examples/fr3_sim_qt.py --mode ik
 
 ```bash
 python examples/fr3_sim_qt.py --mode ik \
-  --posture-cost 0.01 --posture-gain 1.0 --mink-steps 300
+  --posture-cost 0.001 --posture-gain 1.0 --mink-steps 300
 ```
 
 只运行 Qt 控制面板、不启动 MeshCat：
@@ -344,7 +368,7 @@ python examples/fr3_sim_qt.py --no-meshcat
 mamba env update -n fr3sim -f environment.yml
 mamba deactivate
 mamba activate fr3sim
-pip install -e .
+python -m pip install -e . --no-build-isolation
 ```
 
 ## Python 接口示例
@@ -364,7 +388,7 @@ target = pose_from_xyz_rpy(
     np.array([3.1415926, 0.0, 0.2]),
 )
 options = DifferentialIKOptions()
-options.posture_cost = 0.01
+options.posture_cost = 0.001
 options.posture_gain = 1.0
 options.max_iterations = 300
 result = model.mink_inverse_kinematics(target, q0, options)
@@ -406,7 +430,7 @@ target[:3, 3] += [0.03, -0.04, 0.02]
 
 options = DifferentialIKOptions()
 options.dt = 0.02
-options.posture_cost = 1e-2       # Mink PostureTask 的软权重；0 表示关闭
+options.posture_cost = 1e-3       # Mink PostureTask 的软权重；0 表示关闭
 options.posture_gain = 1.0        # Mink task gain，范围 [0, 1]
 options.enforce_velocity_limits = True
 
@@ -429,7 +453,7 @@ python examples/fr3_mink_ik.py
 ```bash
 python examples/fr3_mink_ik.py \
   --target 0.35 0.10 0.45 3.1415926 0.0 0.2 \
-  --posture-cost 0.01 \
+  --posture-cost 0.001 \
   --velocity-limits \
   --steps 300
 ```
@@ -438,7 +462,7 @@ python examples/fr3_mink_ik.py \
 
 ```python
 options = DifferentialIKOptions()
-options.posture_cost = 1e-2
+options.posture_cost = 1e-3
 options.max_iterations = 300
 result = model.mink_inverse_kinematics(target, q, options)
 ```
@@ -473,7 +497,7 @@ ctest --test-dir build --output-on-failure
 本工程不依赖 ROS。`xacro==2.1.1` 和 `PyYAML>=6.0` 已写入 `pyproject.toml`，因此 `python -m pip install -e .` 会把它们安装到当前 mamba 环境：
 
 ```bash
-pip install -e .
+python -m pip install -e .
 ```
 
 如果当前 shell 曾经执行过 ROS 的 `setup.bash`，ROS 的 `PYTHONPATH` 可能让 pip 错以为 `xacro` 已经安装。通过本工程最新的 `environment.yml` 创建或更新环境后，重新激活即可自动隔离这些路径：
@@ -482,7 +506,7 @@ pip install -e .
 mamba env update -n fr3sim -f environment.yml
 mamba deactivate
 mamba activate fr3sim
-pip install -e .
+python -m pip install -e . --no-build-isolation
 ```
 
 如果只想单独安装生成工具：

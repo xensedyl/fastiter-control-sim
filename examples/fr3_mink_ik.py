@@ -54,7 +54,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--posture-cost",
         type=float,
-        default=0.01,
+        default=0.001,
         help="Mink-style soft home PostureTask cost (0 disables it).",
     )
     parser.add_argument(
