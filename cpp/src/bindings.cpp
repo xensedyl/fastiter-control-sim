@@ -21,13 +21,16 @@ PYBIND11_MODULE(_fr3_sim, module) {
       .def_readwrite("damping", &IKOptions::damping)
       .def_readwrite("step_size", &IKOptions::step_size)
       .def_readwrite("max_step_norm", &IKOptions::max_step_norm)
+      .def_readwrite("posture_gain", &IKOptions::posture_gain)
       .def_readwrite("line_search_steps", &IKOptions::line_search_steps)
       .def_readwrite("random_seed", &IKOptions::random_seed)
       .def("__repr__", [](const IKOptions &options) {
         return "IKOptions(max_iterations=" +
                std::to_string(options.max_iterations) +
                ", max_retries=" + std::to_string(options.max_retries) +
-               ", tolerance=" + std::to_string(options.tolerance) + ")";
+               ", tolerance=" + std::to_string(options.tolerance) +
+               ", posture_gain=" + std::to_string(options.posture_gain) +
+               ")";
       });
 
   py::class_<IKResult>(module, "IKResult")

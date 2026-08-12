@@ -18,6 +18,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DESCRIPTION_ROOT = Path(
     os.environ.get("FRANKA_DESCRIPTION_ROOT", "/home/xense/fastiter/franka_description")
 )
+# Edit this value to change the default null-space home-posture constraint.
+# Set it to 0.0 to disable the constraint.  It can also be overridden with
+# the --posture-gain command-line option or the IK-tab spin box.
+DEFAULT_POSTURE_GAIN = float(fr3.IKOptions().posture_gain)
 
 try:
     from PySide6.QtCore import QSignalBlocker, Qt, QTimer, QUrl, Signal
@@ -161,6 +165,7 @@ class Fr3SimWindow(QMainWindow):
         urdf_path: Path,
         *,
         initial_mode: str = "fk",
+        posture_gain: float = DEFAULT_POSTURE_GAIN,
     ) -> None:
         super().__init__()
         self.model = model
@@ -169,6 +174,9 @@ class Fr3SimWindow(QMainWindow):
         self.home_q = np.asarray(model.home_configuration(), dtype=float)
         self.current_q = self.home_q.copy()
         self.ik_options = fr3.IKOptions()
+        if not np.isfinite(posture_gain) or posture_gain < 0.0:
+            raise ValueError("--posture-gain must be a finite non-negative number")
+        self.ik_options.posture_gain = float(posture_gain)
         self._syncing_controls = False
 
         self.fk_timer = QTimer(self)
@@ -303,6 +311,24 @@ class Fr3SimWindow(QMainWindow):
             group_layout.addWidget(control)
         layout.addWidget(group)
 
+        options_group = QGroupBox("IK options")
+        options_layout = QHBoxLayout(options_group)
+        options_layout.addWidget(QLabel("posture_gain (null-space):"))
+        self.posture_gain_spin_box = QDoubleSpinBox()
+        self.posture_gain_spin_box.setRange(0.0, 10.0)
+        self.posture_gain_spin_box.setDecimals(3)
+        self.posture_gain_spin_box.setSingleStep(0.01)
+        self.posture_gain_spin_box.setValue(float(self.ik_options.posture_gain))
+        self.posture_gain_spin_box.setToolTip(
+            "Home-posture attraction in the Jacobian null space; 0 disables it."
+        )
+        self.posture_gain_spin_box.valueChanged.connect(
+            self._on_posture_gain_changed
+        )
+        options_layout.addWidget(self.posture_gain_spin_box)
+        options_layout.addStretch(1)
+        layout.addWidget(options_group)
+
         ik_buttons = QHBoxLayout()
         current_target_button = QPushButton("Set target from current pose")
         current_target_button.clicked.connect(self._sync_ik_target_from_current)
@@ -319,6 +345,19 @@ class Fr3SimWindow(QMainWindow):
         layout.addWidget(self.ik_status)
         layout.addStretch(1)
         return page
+
+    def _on_posture_gain_changed(self, value: float) -> None:
+        """Apply a new null-space gain and re-solve the current IK target."""
+        if self._syncing_controls:
+            return
+        self.ik_options.posture_gain = float(value)
+        self.ik_status.setText(
+            f"posture_gain = {self.ik_options.posture_gain:.3f}\n"
+            "IK option updated; solving..."
+        )
+        self.ik_status.setStyleSheet("font-family: monospace; color: #b36b00;")
+        if self.tabs.currentIndex() == 1:
+            self._schedule_ik(value)
 
     @staticmethod
     def _pose_text(pose: Sequence[Sequence[float]]) -> str:
@@ -412,6 +451,7 @@ class Fr3SimWindow(QMainWindow):
             if not result.success:
                 self.ik_status.setText(
                     "IK not converged\n"
+                    f"posture_gain={self.ik_options.posture_gain:.3f}\n"
                     f"iterations={result.iterations} attempts={result.attempts} "
                     f"error={result.error:.3e}\n"
                     f"position_error={result.position_error:.3e} "
@@ -431,6 +471,7 @@ class Fr3SimWindow(QMainWindow):
             )
             self.ik_status.setText(
                 "IK converged\n"
+                f"posture_gain={self.ik_options.posture_gain:.3f}\n"
                 f"iterations={result.iterations} attempts={result.attempts} "
                 f"error={result.error:.3e}\n"
                 f"q [deg] = {np.array2string(np.degrees(solved), precision=2)}\n"
@@ -507,6 +548,15 @@ def _arguments() -> argparse.Namespace:
         action="store_true",
         help="Run the Qt control panel without MeshCat visualization.",
     )
+    parser.add_argument(
+        "--posture-gain",
+        type=float,
+        default=DEFAULT_POSTURE_GAIN,
+        help=(
+            f"Null-space home-posture gain for IK (default: {DEFAULT_POSTURE_GAIN:g}; "
+            "0 disables the constraint)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -515,6 +565,7 @@ def main() -> int:
     description_root = args.description_root.expanduser().resolve()
     urdf_path = _resolve_urdf(args.urdf, description_root)
     model = fr3.RobotModel(str(urdf_path))
+    print(f"IK posture_gain (null-space): {args.posture_gain:g}")
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("FR3 Control Sim")
@@ -536,6 +587,7 @@ def main() -> int:
         visualizer,
         urdf_path,
         initial_mode=args.mode,
+        posture_gain=args.posture_gain,
     )
     window.show()
     return app.exec()

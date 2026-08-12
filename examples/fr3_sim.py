@@ -18,6 +18,10 @@ import fr3_control_sim as fr3
 DEFAULT_DESCRIPTION_ROOT = Path(
     os.environ.get("FRANKA_DESCRIPTION_ROOT", "/home/xense/fastiter/franka_description")
 )
+# Edit this value to change the default null-space home-posture constraint.
+# Set it to 0.0 to disable the constraint.  It can also be overridden with
+# the --posture-gain command-line option.
+DEFAULT_POSTURE_GAIN = 0.1
 
 
 def _arguments() -> argparse.Namespace:
@@ -48,6 +52,15 @@ def _arguments() -> argparse.Namespace:
         nargs="+",
         metavar="VALUE",
         help="IK target: x y z [roll pitch yaw], in meters and radians.",
+    )
+    parser.add_argument(
+        "--posture-gain",
+        type=float,
+        default=DEFAULT_POSTURE_GAIN,
+        help=(
+            f"Null-space home-posture gain for IK (default: "
+            f"{DEFAULT_POSTURE_GAIN:g}; 0 disables the constraint)."
+        ),
     )
     parser.add_argument("--duration", type=float, default=2.0)
     parser.add_argument("--dt", type=float, default=0.02)
@@ -138,10 +151,16 @@ def _solve_ik(
     model: fr3.RobotModel,
     home: np.ndarray,
     target_values: list[float] | None,
+    posture_gain: float = DEFAULT_POSTURE_GAIN,
 ) -> np.ndarray:
     target = _make_target(model, home, target_values)
     _print_pose("target", target)
-    result = model.inverse_kinematics(target, home, fr3.IKOptions())
+    options = fr3.IKOptions()
+    if not np.isfinite(posture_gain) or posture_gain < 0.0:
+        raise ValueError("--posture-gain must be a finite non-negative number")
+    options.posture_gain = float(posture_gain)
+    print(f"IK posture_gain (null-space): {options.posture_gain:.3f}")
+    result = model.inverse_kinematics(target, home, options)
     error = getattr(result, "error", getattr(result, "residual", float("nan")))
     iterations = getattr(result, "iterations", -1)
     print(f"IK success={result.success} iterations={iterations} error={error:.3e}")
@@ -210,13 +229,21 @@ def _interactive_ik(
     visualizer: object | None,
     duration: float,
     dt: float,
+    posture_gain: float = DEFAULT_POSTURE_GAIN,
 ) -> None:
     current = home.copy()
     options = fr3.IKOptions()
+    if not np.isfinite(posture_gain) or posture_gain < 0.0:
+        raise ValueError("--posture-gain must be a finite non-negative number")
+    options.posture_gain = float(posture_gain)
     if visualizer is not None:
         visualizer.update(current)
 
     print("\nInteractive IK: input a target pose.")
+    print(
+        f"  posture_gain (null-space): {options.posture_gain:.3f} "
+        "(set with --posture-gain; 0 disables)"
+    )
     print("  x y z                    (meters; keep current orientation)")
     print("  x y z roll pitch yaw     (meters + radians)")
     print("  example: 0.35 0.10 0.45")
@@ -297,6 +324,7 @@ def main() -> None:
     print(f"URDF: {urdf_path}")
     print(f"end effector: {model.end_effector_frame}")
     print(f"joints ({model.nq}): {', '.join(model.joint_names)}")
+    print(f"IK posture_gain (null-space): {args.posture_gain:g}")
 
     visualizer = None
     if not args.headless:
@@ -314,13 +342,20 @@ def main() -> None:
         _interactive_fk(model, home, visualizer)
         return
     if args.mode == "ik" and args.target is None:
-        _interactive_ik(model, home, visualizer, args.duration, args.dt)
+        _interactive_ik(
+            model,
+            home,
+            visualizer,
+            args.duration,
+            args.dt,
+            args.posture_gain,
+        )
         return
 
     if args.mode == "fk":
         q_goal = _run_fk(model, home, args.q)
     else:
-        q_goal = _solve_ik(model, home, args.target)
+        q_goal = _solve_ik(model, home, args.target, args.posture_gain)
 
     if args.mode == "demo":
         _print_pose("home", model.forward_kinematics(home))

@@ -45,6 +45,31 @@ int main() {
       throw std::runtime_error("IK/FK position round-trip error is too large");
     }
 
+    // FR3 is redundant: the same TCP pose can be reached with different elbow
+    // postures.  The null-space objective should recover the ready/home
+    // posture when solving the home target from a deliberately skewed seed.
+    Eigen::VectorXd q_skewed(7);
+    q_skewed << -27.75, -48.05, 17.44, -134.54, 12.89, 87.89, 29.59;
+    q_skewed *= M_PI / 180.0;
+    const Eigen::Matrix4d near_home_target =
+        fr3_control_sim::pose_from_xyz_rpy(
+            Eigen::Vector3d(0.3069, 0.0, 0.4869),
+            Eigen::Vector3d(-3.1416, 0.0, 0.0));
+    fr3_control_sim::IKOptions posture_options;
+    posture_options.max_iterations = 1000;
+    posture_options.max_retries = 0;
+    posture_options.posture_gain = 0.1;
+    const auto posture_result =
+        model.inverse_kinematics(near_home_target, q_skewed, posture_options);
+    if (!posture_result.success) {
+      throw std::runtime_error("Null-space posture IK did not converge");
+    }
+    const double posture_distance = (posture_result.q - q_home).norm();
+    if (posture_distance > 1e-3) {
+      throw std::runtime_error(
+          "Null-space posture objective did not recover home");
+    }
+
     const Eigen::MatrixXd trajectory =
         model.minimum_jerk_trajectory(q_home, result.q, 1.0, 0.02);
     if (trajectory.rows() != 51 || trajectory.cols() != 7 ||

@@ -9,6 +9,7 @@
 #include <pinocchio/parsers/urdf.hpp>
 #include <pinocchio/spatial/explog.hpp>
 
+#include <Eigen/QR>
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -244,11 +245,16 @@ IKResult RobotModel::inverse_kinematics_once(const pinocchio::SE3 &target,
                                              pinocchio::FrameIndex frame_id,
                                              const IKOptions &options) const {
   Eigen::VectorXd q = clamp_configuration(q_seed);
+  const Eigen::VectorXd home = home_configuration();
   ErrorState state = pose_error(q, target, frame_id);
   int stalled_iterations = 0;
+  constexpr double posture_tolerance = 1e-4;
 
   for (int iteration = 0; iteration < options.max_iterations; ++iteration) {
-    if (state.norm <= options.tolerance) {
+    const Eigen::VectorXd posture_error = pinocchio::difference(model_, q, home);
+    if (state.norm <= options.tolerance &&
+        (options.posture_gain <= 0.0 ||
+         posture_error.norm() <= posture_tolerance)) {
       return IKResult{q,
                       true,
                       iteration,
@@ -278,8 +284,26 @@ IKResult RobotModel::inverse_kinematics_once(const pinocchio::SE3 &target,
     const double adaptive_damping =
         options.damping * std::max(1.0, 10.0 * state.norm);
     normal.diagonal().array() += adaptive_damping;
-    Eigen::VectorXd delta = -options.step_size * task_jacobian.transpose() *
-                            normal.ldlt().solve(state.vector);
+    const Eigen::Matrix<double, 6, 6> normal_inverse =
+        normal.ldlt().solve(Eigen::Matrix<double, 6, 6>::Identity());
+    const Eigen::MatrixXd damped_pseudoinverse =
+        task_jacobian.transpose() * normal_inverse;
+    Eigen::VectorXd delta =
+        -options.step_size * damped_pseudoinverse * state.vector;
+
+    // FR3 has seven arm joints for a six-dimensional end-effector task.  Use
+    // the remaining null-space motion to prefer the standard ready/home
+    // posture without changing the first-order Cartesian task motion.
+    if (options.posture_gain > 0.0 && state.norm <= options.tolerance) {
+      Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> decomposition(
+          task_jacobian);
+      decomposition.setThreshold(1e-8);
+      const Eigen::MatrixXd exact_pseudoinverse = decomposition.pseudoInverse();
+      const Eigen::MatrixXd nullspace_projector =
+          Eigen::MatrixXd::Identity(model_.nv, model_.nv) -
+          exact_pseudoinverse * task_jacobian;
+      delta += options.posture_gain * nullspace_projector * posture_error;
+    }
 
     const double delta_norm = delta.norm();
     if (options.max_step_norm > 0.0 && delta_norm > options.max_step_norm) {
@@ -294,7 +318,14 @@ IKResult RobotModel::inverse_kinematics_once(const pinocchio::SE3 &target,
       candidate = clamp_configuration(candidate);
       const ErrorState candidate_state =
           pose_error(candidate, target, frame_id);
-      if (candidate_state.norm + 1e-12 < state.norm) {
+      const double candidate_posture_error =
+          pinocchio::difference(model_, candidate, home).norm();
+      const bool task_improved = candidate_state.norm + 1e-12 < state.norm;
+      const bool posture_improved_at_solution =
+          options.posture_gain > 0.0 && state.norm <= options.tolerance &&
+          candidate_state.norm <= options.tolerance &&
+          candidate_posture_error + 1e-10 < posture_error.norm();
+      if (task_improved || posture_improved_at_solution) {
         q = candidate;
         state = candidate_state;
         improved = true;
@@ -309,7 +340,7 @@ IKResult RobotModel::inverse_kinematics_once(const pinocchio::SE3 &target,
       ++stalled_iterations;
       if (stalled_iterations >= 10) {
         return IKResult{q,
-                        false,
+                        state.norm <= options.tolerance,
                         iteration + 1,
                         1,
                         state.norm,
@@ -320,7 +351,7 @@ IKResult RobotModel::inverse_kinematics_once(const pinocchio::SE3 &target,
   }
 
   return IKResult{q,
-                  false,
+                  state.norm <= options.tolerance,
                   options.max_iterations,
                   1,
                   state.norm,
@@ -342,6 +373,7 @@ IKResult RobotModel::inverse_kinematics(const Eigen::Matrix4d &target_matrix,
   if (options.max_iterations <= 0 || options.max_retries < 0 ||
       options.tolerance <= 0.0 || options.damping < 0.0 ||
       options.step_size <= 0.0 || options.max_step_norm < 0.0 ||
+      !std::isfinite(options.posture_gain) || options.posture_gain < 0.0 ||
       options.line_search_steps <= 0) {
     throw std::invalid_argument("Invalid IK options");
   }

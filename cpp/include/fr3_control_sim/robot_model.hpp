@@ -20,6 +20,7 @@ struct IKOptions {
   double damping = 1e-6;
   double step_size = 0.7;
   double max_step_norm = 0.25;
+  double posture_gain = 0.1;
   int line_search_steps = 8;
   unsigned int random_seed = 42;
 };
