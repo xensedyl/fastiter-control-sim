@@ -60,6 +60,7 @@ PYBIND11_MODULE(_fr3_sim, module) {
                              &RobotModel::end_effector_frame)
       .def_property_readonly("finger_position", &RobotModel::finger_position)
       .def_property_readonly("joint_names", &RobotModel::joint_names)
+      .def_property_readonly("mimic_joint_names", &RobotModel::mimic_joint_names)
       .def_property_readonly("joint_limits", &RobotModel::joint_limits)
       .def_property_readonly("frame_names", &RobotModel::frame_names)
       .def("home_configuration", &RobotModel::home_configuration)

@@ -47,6 +47,44 @@ def _test_cad_urdf() -> None:
     assert all(Path(visual.geometry_data).is_file() for visual in visuals)
 
 
+def _test_urdf0820_if_present() -> None:
+    urdf = PROJECT_ROOT / "models" / "URDF0820" / "URDF0820.urdf"
+    if not urdf.is_file():
+        return
+
+    model = fr3.RobotModel(str(urdf))
+    assert model.nq == 7
+    assert model.nv == 7
+    assert model.end_effector_frame == "link_7"
+    assert model.mimic_joint_names == ["joint_5-2", "joint_6"]
+    # joint_5-2 and joint_6 are mimic branches; joint_5-1 is the one
+    # independent configuration coordinate exposed to the solver.
+    assert model.joint_names == [
+        "joint_1",
+        "joint_2",
+        "joint_3",
+        "joint_4",
+        "joint_5",
+        "joint_5-1",
+        "joint_7",
+    ]
+    home = np.asarray(model.home_configuration(), dtype=float)
+    assert np.allclose(home, np.radians([0.0, -45.0, 0.0, 135.0, 0.0, 0.0, -45.0]))
+
+    target_q = home + np.radians([2.0, -2.0, 2.0, -2.0, 2.0, 3.0, -2.0])
+    target = np.asarray(model.forward_kinematics(target_q), dtype=float)
+    result = model.inverse_kinematics(target, home, fr3.IKOptions())
+    assert result.success, result
+    recovered = np.asarray(model.forward_kinematics(result.q), dtype=float)
+    assert np.linalg.norm(recovered[:3, 3] - target[:3, 3]) < 1e-5
+
+    from fr3_control_sim.visualizer import _parse_visuals
+
+    visuals = _parse_visuals(urdf, None)
+    assert len(visuals) == 10
+    assert all(Path(visual.geometry_data).is_file() for visual in visuals)
+
+
 def main() -> None:
     model = fr3.RobotModel(str(PROJECT_ROOT / "models" / "fr3_franka_hand.urdf"))
     assert model.nq == 7
@@ -90,12 +128,15 @@ def main() -> None:
     assert posture_distance < 1e-3, posture_distance
 
     _test_cad_urdf()
+    _test_urdf0820_if_present()
 
     print("Python/pybind smoke test passed")
     print(f"  IK residual: {result.error:.3e}")
     print(f"  position round-trip error: {position_error:.3e} m")
     print(f"  null-space home distance: {posture_distance:.3e} rad")
     print("  CAD URDF load/FK/IK/STL paths: passed")
+    if (PROJECT_ROOT / "models" / "URDF0820" / "URDF0820.urdf").is_file():
+        print("  URDF0820 mimic/FK/IK/STL paths: passed")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,8 @@
 #include <pinocchio/parsers/urdf.hpp>
 #include <pinocchio/spatial/explog.hpp>
 
+#include <urdf_parser/urdf_parser.h>
+
 #include <Eigen/QR>
 #include <algorithm>
 #include <cmath>
@@ -40,6 +42,21 @@ finger_joint_ids(const pinocchio::Model &model) {
   return ids;
 }
 
+bool has_non_finger_mimic_joint(const std::string &urdf_path) {
+  const auto urdf = urdf::parseURDFFile(urdf_path);
+  if (!urdf) {
+    throw std::invalid_argument("Could not parse URDF: " + urdf_path);
+  }
+  for (const auto &entry : urdf->joints_) {
+    const auto &joint = entry.second;
+    if (joint && joint->mimic && entry.first != "fr3_finger_joint1" &&
+        entry.first != "fr3_finger_joint2") {
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 RobotModel::RobotModel(const std::string &urdf_path,
@@ -57,21 +74,40 @@ RobotModel::RobotModel(const std::string &urdf_path,
   }
 
   pinocchio::Model full_model;
-  pinocchio::urdf::buildModel(urdf_path_, full_model);
+  // Parse non-finger mimic tags. The 0820 export contains two visible wrist
+  // joints (`joint_5-2` and `joint_6`) that are mechanically coupled to
+  // `joint_5-1`; parsing with mimic=true keeps those branches in the
+  // kinematic tree while exposing only the seven independent variables. The
+  // official model's finger mimic is intentionally parsed as ordinary joints
+  // and then reduced below, because locking its directing joint would leave a
+  // dangling mimic index in Pinocchio.
+  const bool parse_mimic = has_non_finger_mimic_joint(urdf_path_);
+  pinocchio::urdf::buildModel(urdf_path_, full_model, false, parse_mimic);
 
-  const auto locked_joints = finger_joint_ids(full_model);
-  if (locked_joints.size() == 1U) {
+  const auto finger_joints = finger_joint_ids(full_model);
+  if (finger_joints.size() == 1U) {
     throw std::runtime_error(
         "URDF contains only one FR3 finger joint; expected both or neither");
   }
 
-  if (locked_joints.size() == 2U) {
+  std::vector<pinocchio::JointIndex> independent_finger_joints;
+  for (const auto joint_id : finger_joints) {
+    if (full_model.joints[joint_id].nq() > 0) {
+      independent_finger_joints.push_back(joint_id);
+    }
+  }
+
+  if (!finger_joints.empty() && independent_finger_joints.empty()) {
+    throw std::runtime_error("FR3 finger joints have no independent configuration");
+  }
+
+  if (!independent_finger_joints.empty()) {
     if (finger_position_ < 0.0 || finger_position_ > 0.04) {
       throw std::invalid_argument(
           "finger_position must be in [0.0, 0.04] meters for the FR3 hand");
     }
     Eigen::VectorXd reference = pinocchio::neutral(full_model);
-    for (const auto joint_id : locked_joints) {
+    for (const auto joint_id : independent_finger_joints) {
       const int idx_q = full_model.joints[joint_id].idx_q();
       if (idx_q < 0 || full_model.joints[joint_id].nq() != 1) {
         throw std::runtime_error(
@@ -79,7 +115,8 @@ RobotModel::RobotModel(const std::string &urdf_path,
       }
       reference[idx_q] = finger_position_;
     }
-    model_ = pinocchio::buildReducedModel(full_model, locked_joints, reference);
+    model_ = pinocchio::buildReducedModel(full_model, independent_finger_joints,
+                                          reference);
   } else {
     model_ = std::move(full_model);
   }
@@ -134,6 +171,17 @@ std::vector<std::string> RobotModel::joint_names() const {
   return names;
 }
 
+std::vector<std::string> RobotModel::mimic_joint_names() const {
+  std::vector<std::string> names;
+  names.reserve(model_.mimicking_joints.size());
+  for (const auto joint_id : model_.mimicking_joints) {
+    if (joint_id < model_.names.size()) {
+      names.push_back(model_.names[joint_id]);
+    }
+  }
+  return names;
+}
+
 std::vector<std::pair<double, double>> RobotModel::joint_limits() const {
   std::vector<std::pair<double, double>> limits;
   limits.reserve(static_cast<std::size_t>(model_.nq));
@@ -167,6 +215,7 @@ Eigen::VectorXd RobotModel::home_configuration() const {
       model_.existJointName("joint_2") && model_.existJointName("joint_3") &&
       model_.existJointName("joint_4") && model_.existJointName("joint_5") &&
       model_.existJointName("joint_6") && model_.existJointName("joint_7");
+  const bool has_mimic_wrist = !model_.mimicking_joints.empty();
 
   Eigen::VectorXd q = pinocchio::neutral(model_);
   if (is_official_fr3) {
@@ -175,11 +224,13 @@ Eigen::VectorXd RobotModel::home_configuration() const {
     return clamp_configuration(q);
   }
   if (is_cad_fr3) {
-    // This CAD export uses the opposite axis convention for joints 4, 6 and
-    // 7.  The signs below reproduce the official FR3 ready pose while
-    // respecting the exported limits.
+    // The original CAD export has an independent joint_6.  The 0820 export
+    // instead has joint_5-1 as the independent coordinate and both
+    // joint_5-2 and joint_6 as mimic branches, whose valid range is only
+    // +/-0.8 rad. Keep that wrist at its neutral coupled position rather
+    // than silently clamping the old +/-90 degree ready-pose value.
     q << 0.0, -M_PI / 4.0, 0.0, 3.0 * M_PI / 4.0, 0.0,
-        -M_PI / 2.0, -M_PI / 4.0;
+        (has_mimic_wrist ? 0.0 : -M_PI / 2.0), -M_PI / 4.0;
     return clamp_configuration(q);
   }
 

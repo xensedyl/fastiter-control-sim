@@ -64,6 +64,7 @@ def _resolve_urdf(requested: Path | None, description_root: Path) -> Path:
         description_root.expanduser() / "urdfs" / "fr3_franka_hand.urdf",
         PROJECT_ROOT / "models" / "fr3_franka_hand.urdf",
         PROJECT_ROOT / "models" / "URDF" / "URDF.urdf",
+        PROJECT_ROOT / "models" / "URDF0820" / "URDF0820.urdf",
         PROJECT_ROOT / "resources" / "fr3_franka_hand.urdf",
         PROJECT_ROOT / "share" / "fr3_control_sim" / "fr3_franka_hand.urdf",
     )
@@ -278,12 +279,16 @@ class Fr3SimWindow(QMainWindow):
         group_layout = QVBoxLayout(group)
         limits = np.asarray(self.model.joint_limits, dtype=float)
         home_degrees = np.degrees(self.home_q)
+        mimic_names = set(getattr(self.model, "mimic_joint_names", ()))
         self.fk_controls: list[FloatControl] = []
         for index, (joint_name, limit, value) in enumerate(
             zip(self.model.joint_names, limits, home_degrees, strict=True)
         ):
+            label = f"joint{index + 1} ({joint_name})"
+            if joint_name == "joint_5-1" and mimic_names:
+                label += f" -> mimics {', '.join(sorted(mimic_names))}"
             control = FloatControl(
-                f"joint{index + 1} ({joint_name})",
+                label,
                 math.degrees(float(limit[0])),
                 math.degrees(float(limit[1])),
                 float(value),

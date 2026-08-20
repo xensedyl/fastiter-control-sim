@@ -83,6 +83,7 @@ def _resolve_urdf(requested: Path | None, description_root: Path) -> Path:
         description_root.expanduser() / "urdfs" / "fr3_franka_hand.urdf",
         PROJECT_ROOT / "models" / "fr3_franka_hand.urdf",
         PROJECT_ROOT / "models" / "URDF" / "URDF.urdf",
+        PROJECT_ROOT / "models" / "URDF0820" / "URDF0820.urdf",
         PROJECT_ROOT / "resources" / "fr3_franka_hand.urdf",
         PROJECT_ROOT / "share" / "fr3_control_sim" / "fr3_franka_hand.urdf",
     )
@@ -343,6 +344,9 @@ def main() -> None:
     print(f"URDF: {urdf_path}")
     print(f"end effector: {model.end_effector_frame}")
     print(f"joints ({model.nq}): {', '.join(model.joint_names)}")
+    mimic_names = list(getattr(model, "mimic_joint_names", ()))
+    if mimic_names:
+        print(f"mimic joints: {', '.join(mimic_names)}")
     print(f"IK posture_gain (null-space): {args.posture_gain:g}")
 
     visualizer = None

@@ -48,6 +48,7 @@ public:
   double finger_position() const { return finger_position_; }
 
   std::vector<std::string> joint_names() const;
+  std::vector<std::string> mimic_joint_names() const;
   std::vector<std::pair<double, double>> joint_limits() const;
   std::vector<std::string> frame_names() const;
 

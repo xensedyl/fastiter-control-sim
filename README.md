@@ -29,6 +29,8 @@ examples/fr3_sim_qt.py                   Qt FK/IK 滑条控制界面
 models/fr3_franka_hand.urdf              FR3 + Franka Hand 模型
 models/URDF/URDF.urdf                    CAD 导出的 7 轴无手爪模型
 models/URDF/meshes/                       CAD 模型的 STL 网格
+models/URDF0820/URDF0820.urdf            带 mimic 腕部连杆的 0820 模型
+models/URDF0820/meshes/                  0820 模型的 STL 网格
 cpp/tests/test_kinematics.cpp            C++ 测试
 tests/smoke_test.py                      Python/pybind 测试
 ```
@@ -199,6 +201,17 @@ CAD 模型采用不同的关节轴符号，对应的 ready/home 姿态为：
 ```
 
 该 URDF 没有额外的 TCP/tool0 固定关节，因此 IK 控制的是 `link_7` 原点，不会自行假定工具长度。
+
+### URDF0820 的 mimic 关节
+
+如果使用新的 0820 导出模型：
+
+```bash
+python examples/fr3_sim_qt.py \
+  --urdf models/URDF0820/URDF0820.urdf
+```
+
+该模型的 `joint_5-2` 和 `joint_6` 都通过 URDF `<mimic>` 约束跟随 `joint_5-1`。程序会让 Pinocchio 解析 mimic 关系，因此对外仍是 7 个独立自由度，不会把两个从动关节错误计入 `nq`。FK、Jacobian 和 IK 都会保留两个从动分支的几何影响。第 6 个独立输入实际对应 `joint_5-1`，它会同步驱动 `joint_5-2` 和 `joint_6`；这两个从动关节不是额外的独立滑条。
 
 ### Headless 测试
 
