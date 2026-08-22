@@ -23,6 +23,12 @@ DEFAULT_DESCRIPTION_ROOT = Path(
 # Set it to 0.0 to disable the constraint.  It can also be overridden with
 # the --posture-gain command-line option or the IK-tab spin box.
 DEFAULT_POSTURE_GAIN = float(fr3.IKOptions().posture_gain)
+DEFAULT_CANDIDATE_SCORING = bool(fr3.IKOptions().candidate_scoring_enabled)
+DEFAULT_WEIGHT_MANIPULABILITY = float(fr3.IKOptions().weight_manipulability)
+DEFAULT_WEIGHT_NEUTRAL = float(fr3.IKOptions().weight_neutral)
+DEFAULT_WEIGHT_CURRENT = float(fr3.IKOptions().weight_current)
+DEFAULT_MAX_SEED_DISTANCE = float(fr3.IKOptions().max_seed_distance)
+DEFAULT_MANIPULABILITY_SCALE = float(fr3.IKOptions().manipulability_scale)
 DEFAULT_IK_UPDATE_HZ = 30.0
 DEFAULT_RENDER_HZ = 60.0
 DEFAULT_SMOOTH_TIME = 0.12
@@ -32,6 +38,7 @@ try:
     from PySide6.QtGui import QDesktopServices
     from PySide6.QtWidgets import (
         QApplication,
+        QCheckBox,
         QDoubleSpinBox,
         QGroupBox,
         QHBoxLayout,
@@ -172,6 +179,12 @@ class Fr3SimWindow(QMainWindow):
         *,
         initial_mode: str = "fk",
         posture_gain: float = DEFAULT_POSTURE_GAIN,
+        candidate_scoring: bool = DEFAULT_CANDIDATE_SCORING,
+        weight_manipulability: float = DEFAULT_WEIGHT_MANIPULABILITY,
+        weight_neutral: float = DEFAULT_WEIGHT_NEUTRAL,
+        weight_current: float = DEFAULT_WEIGHT_CURRENT,
+        max_seed_distance: float = DEFAULT_MAX_SEED_DISTANCE,
+        manipulability_scale: float = DEFAULT_MANIPULABILITY_SCALE,
         ik_algorithm: str = "dls",
         ik_update_hz: float = DEFAULT_IK_UPDATE_HZ,
         render_hz: float = DEFAULT_RENDER_HZ,
@@ -189,6 +202,17 @@ class Fr3SimWindow(QMainWindow):
         self.ik_options = fr3.IKOptions()
         if not np.isfinite(posture_gain) or posture_gain < 0.0:
             raise ValueError("--posture-gain must be a finite non-negative number")
+        for name, value in (
+            ("weight_manipulability", weight_manipulability),
+            ("weight_neutral", weight_neutral),
+            ("weight_current", weight_current),
+            ("max_seed_distance", max_seed_distance),
+            ("manipulability_scale", manipulability_scale),
+        ):
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if manipulability_scale <= 0.0:
+            raise ValueError("manipulability_scale must be positive")
         if not np.isfinite(ik_update_hz) or ik_update_hz <= 0.0:
             raise ValueError("--ik-update-hz must be a finite positive number")
         if not np.isfinite(render_hz) or render_hz <= 0.0:
@@ -196,6 +220,12 @@ class Fr3SimWindow(QMainWindow):
         if not np.isfinite(smooth_time) or smooth_time < 0.0:
             raise ValueError("--smooth-time must be a finite non-negative number")
         self.ik_options.posture_gain = float(posture_gain)
+        self.ik_options.candidate_scoring_enabled = bool(candidate_scoring)
+        self.ik_options.weight_manipulability = float(weight_manipulability)
+        self.ik_options.weight_neutral = float(weight_neutral)
+        self.ik_options.weight_current = float(weight_current)
+        self.ik_options.max_seed_distance = float(max_seed_distance)
+        self.ik_options.manipulability_scale = float(manipulability_scale)
         self.ik_update_hz = float(ik_update_hz)
         self.render_hz = float(render_hz)
         self.smooth_time = float(smooth_time)
@@ -352,9 +382,10 @@ class Fr3SimWindow(QMainWindow):
         layout.addWidget(group)
 
         options_group = QGroupBox("IK options")
-        options_layout = QHBoxLayout(options_group)
-        options_layout.addWidget(QLabel(f"algorithm: {self.ik_algorithm}"))
-        options_layout.addWidget(QLabel("posture_gain (null-space):"))
+        options_layout = QVBoxLayout(options_group)
+        first_options_row = QHBoxLayout()
+        first_options_row.addWidget(QLabel(f"algorithm: {self.ik_algorithm}"))
+        first_options_row.addWidget(QLabel("posture_gain (null-space):"))
         self.posture_gain_spin_box = QDoubleSpinBox()
         self.posture_gain_spin_box.setRange(0.0, 10.0)
         self.posture_gain_spin_box.setDecimals(3)
@@ -366,8 +397,70 @@ class Fr3SimWindow(QMainWindow):
         self.posture_gain_spin_box.valueChanged.connect(
             self._on_posture_gain_changed
         )
-        options_layout.addWidget(self.posture_gain_spin_box)
-        options_layout.addStretch(1)
+        first_options_row.addWidget(self.posture_gain_spin_box)
+        first_options_row.addStretch(1)
+        options_layout.addLayout(first_options_row)
+
+        scoring_row = QHBoxLayout()
+        self.candidate_scoring_check_box = QCheckBox("candidate scoring")
+        self.candidate_scoring_check_box.setChecked(
+            bool(self.ik_options.candidate_scoring_enabled)
+        )
+        self.candidate_scoring_check_box.setToolTip(
+            "Rank successful Pinocchio IK candidates by current/neutral "
+            "distance and manipulability."
+        )
+        self.candidate_scoring_check_box.toggled.connect(
+            self._on_candidate_scoring_changed
+        )
+        scoring_row.addWidget(self.candidate_scoring_check_box)
+
+        self.candidate_weight_spins: dict[str, QDoubleSpinBox] = {}
+        for name, label, value in (
+            ("weight_manipulability", "manip", self.ik_options.weight_manipulability),
+            ("weight_neutral", "neutral", self.ik_options.weight_neutral),
+            ("weight_current", "current", self.ik_options.weight_current),
+        ):
+            scoring_row.addWidget(QLabel(f"{label}:"))
+            spin = QDoubleSpinBox()
+            spin.setRange(0.0, 100.0)
+            spin.setDecimals(4)
+            spin.setSingleStep(0.01)
+            spin.setValue(float(value))
+            spin.setToolTip(f"Candidate score weight: {name}")
+            spin.valueChanged.connect(
+                lambda changed, field=name: self._on_candidate_weight_changed(
+                    field, changed
+                )
+            )
+            self.candidate_weight_spins[name] = spin
+            scoring_row.addWidget(spin)
+
+        scoring_row.addWidget(QLabel("max distance:"))
+        self.max_seed_distance_spin_box = QDoubleSpinBox()
+        self.max_seed_distance_spin_box.setRange(0.0, 10.0)
+        self.max_seed_distance_spin_box.setDecimals(4)
+        self.max_seed_distance_spin_box.setSingleStep(0.01)
+        self.max_seed_distance_spin_box.setValue(
+            float(self.ik_options.max_seed_distance)
+        )
+        self.max_seed_distance_spin_box.setToolTip(
+            "Hard normalized joint-distance gate; 0 disables it."
+        )
+        self.max_seed_distance_spin_box.valueChanged.connect(
+            self._on_max_seed_distance_changed
+        )
+        scoring_row.addWidget(self.max_seed_distance_spin_box)
+        scoring_row.addStretch(1)
+        options_layout.addLayout(scoring_row)
+        if self.ik_algorithm == "lefranx-weighted":
+            # The separate URDF-adapted weighted solver has its own score
+            # options; do not leave controls visible that it ignores.
+            self.posture_gain_spin_box.setEnabled(False)
+            self.candidate_scoring_check_box.setEnabled(False)
+            for spin in self.candidate_weight_spins.values():
+                spin.setEnabled(False)
+            self.max_seed_distance_spin_box.setEnabled(False)
         layout.addWidget(options_group)
 
         ik_buttons = QHBoxLayout()
@@ -399,6 +492,24 @@ class Fr3SimWindow(QMainWindow):
         self.ik_status.setStyleSheet("font-family: monospace; color: #b36b00;")
         if self.tabs.currentIndex() == 1:
             self._schedule_ik(value)
+
+    def _on_candidate_scoring_changed(self, enabled: bool) -> None:
+        if self._syncing_controls:
+            return
+        self.ik_options.candidate_scoring_enabled = bool(enabled)
+        self._schedule_ik(float(enabled))
+
+    def _on_candidate_weight_changed(self, field: str, value: float) -> None:
+        if self._syncing_controls:
+            return
+        setattr(self.ik_options, field, float(value))
+        self._schedule_ik(value)
+
+    def _on_max_seed_distance_changed(self, value: float) -> None:
+        if self._syncing_controls:
+            return
+        self.ik_options.max_seed_distance = float(value)
+        self._schedule_ik(value)
 
     @staticmethod
     def _pose_text(pose: Sequence[Sequence[float]]) -> str:
@@ -560,7 +671,13 @@ class Fr3SimWindow(QMainWindow):
                     f"{result.valid_solutions} samples={result.samples_tested}"
                 )
             else:
-                option_text = f"posture_gain={self.ik_options.posture_gain:.3f}"
+                option_text = (
+                    f"posture_gain={self.ik_options.posture_gain:.3f} "
+                    f"candidate_scoring={self.ik_options.candidate_scoring_enabled}\n"
+                    f"score={result.score:.4g} manip={result.manipulability:.4g} "
+                    f"neutral={result.neutral_distance:.4g} "
+                    f"current={result.current_distance:.4g}"
+                )
             if not result.success:
                 self.ik_status.setText(
                     "IK not converged\n"
@@ -694,6 +811,30 @@ def _arguments() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--candidate-scoring",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_CANDIDATE_SCORING,
+        help="Rank successful Pinocchio IK candidates (default: enabled).",
+    )
+    parser.add_argument("--weight-manipulability", type=float,
+                        default=DEFAULT_WEIGHT_MANIPULABILITY)
+    parser.add_argument("--weight-neutral", type=float,
+                        default=DEFAULT_WEIGHT_NEUTRAL)
+    parser.add_argument("--weight-current", type=float,
+                        default=DEFAULT_WEIGHT_CURRENT)
+    parser.add_argument(
+        "--max-seed-distance",
+        type=float,
+        default=DEFAULT_MAX_SEED_DISTANCE,
+        help="Hard normalized seed-distance gate; 0 disables it.",
+    )
+    parser.add_argument(
+        "--manipulability-scale",
+        type=float,
+        default=DEFAULT_MANIPULABILITY_SCALE,
+        help="Scale used to bound the manipulability score.",
+    )
+    parser.add_argument(
         "--ik-update-hz",
         type=float,
         default=DEFAULT_IK_UPDATE_HZ,
@@ -732,6 +873,11 @@ def main() -> int:
         print("IK algorithm: LeFranX weighted free-joint search (URDF-adapted)")
     else:
         print(f"IK posture_gain (null-space): {args.posture_gain:g}")
+        print(
+            f"candidate scoring={args.candidate_scoring} "
+            f"weights(manip={args.weight_manipulability:g}, "
+            f"neutral={args.weight_neutral:g}, current={args.weight_current:g})"
+        )
     print(
         "Qt smoothing: "
         f"IK {args.ik_update_hz:g} Hz, render {args.render_hz:g} Hz, "
@@ -759,6 +905,12 @@ def main() -> int:
         urdf_path,
         initial_mode=args.mode,
         posture_gain=args.posture_gain,
+        candidate_scoring=args.candidate_scoring,
+        weight_manipulability=args.weight_manipulability,
+        weight_neutral=args.weight_neutral,
+        weight_current=args.weight_current,
+        max_seed_distance=args.max_seed_distance,
+        manipulability_scale=args.manipulability_scale,
         ik_algorithm=args.ik_algorithm,
         ik_update_hz=args.ik_update_hz,
         render_hz=args.render_hz,

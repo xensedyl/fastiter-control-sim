@@ -38,6 +38,40 @@ def _test_cad_urdf() -> None:
     recovered = np.asarray(model.forward_kinematics(result.q), dtype=float)
     assert np.linalg.norm(recovered[:3, 3] - target[:3, 3]) < 1e-5
 
+    # The Pinocchio solver now incorporates the useful part of LeFranX's
+    # weighted selector: successful retries are ranked by seed/neutral
+    # distance and manipulability.  With no retries this still exercises the
+    # metric path deterministically.
+    scoring_options = fr3.IKOptions()
+    scoring_options.max_retries = 0
+    scoring_options.posture_gain = 0.0
+    scoring_options.candidate_scoring_enabled = True
+    scoring_options.weight_current = 2.0
+    scoring_result = model.inverse_kinematics(target, home, scoring_options)
+    assert scoring_result.success, scoring_result
+    assert np.isfinite(scoring_result.score)
+    assert np.isfinite(scoring_result.manipulability)
+    assert np.isfinite(scoring_result.current_distance)
+    assert np.isfinite(scoring_result.neutral_distance)
+
+    gated_options = fr3.IKOptions()
+    gated_options.posture_gain = 0.0
+    gated_options.max_seed_distance = 1e-8
+    gated_target_q = home + np.radians([8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    gated_target = np.asarray(model.forward_kinematics(gated_target_q), dtype=float)
+    gated_result = model.inverse_kinematics(gated_target, home, gated_options)
+    assert not gated_result.success, gated_result
+
+    invalid_options = fr3.IKOptions()
+    invalid_options.candidate_scoring_enabled = True
+    invalid_options.weight_current = -1.0
+    try:
+        model.inverse_kinematics(target, home, invalid_options)
+    except (ValueError, RuntimeError):
+        pass
+    else:
+        raise AssertionError("negative candidate weight was accepted")
+
     weighted_options = fr3.FrankaWeightedIKOptions()
     weighted_options.samples = 21
     weighted_options.max_iterations = 80

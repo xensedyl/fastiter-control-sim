@@ -12,6 +12,7 @@
 #include <urdf_parser/urdf_parser.h>
 
 #include <Eigen/QR>
+#include <Eigen/SVD>
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -515,10 +516,118 @@ IKResult RobotModel::inverse_kinematics(const Eigen::Matrix4d &target_matrix,
                               target_matrix.topRightCorner<3, 1>());
   const auto frame_id = resolve_frame(end_effector_frame_);
 
+  if (options.candidate_scoring_enabled) {
+    for (const double weight : {options.weight_manipulability,
+                                options.weight_neutral,
+                                options.weight_current}) {
+      if (!std::isfinite(weight) || weight < 0.0) {
+        throw std::invalid_argument(
+            "candidate scoring weights must be finite and non-negative");
+      }
+    }
+    if (!std::isfinite(options.max_seed_distance) ||
+        options.max_seed_distance < 0.0) {
+      throw std::invalid_argument(
+          "max_seed_distance must be finite and non-negative");
+    }
+    if (!std::isfinite(options.manipulability_scale) ||
+        options.manipulability_scale <= 0.0) {
+      throw std::invalid_argument(
+          "manipulability_scale must be finite and positive");
+    }
+    if ((options.neutral_q.size() != 0 &&
+         options.neutral_q.size() != model_.nq) ||
+        (options.joint_weights.size() != 0 &&
+         options.joint_weights.size() != model_.nq)) {
+      throw std::invalid_argument(
+          "neutral_q and joint_weights must be empty or have nq values");
+    }
+    if (options.neutral_q.size() != 0 &&
+        !options.neutral_q.array().isFinite().all()) {
+      throw std::invalid_argument("neutral_q contains NaN or infinity");
+    }
+    if (options.joint_weights.size() != 0 &&
+        (!options.joint_weights.array().isFinite().all() ||
+         (options.joint_weights.array() < 0.0).any())) {
+      throw std::invalid_argument(
+          "joint_weights must be finite and non-negative");
+    }
+  }
+
+  const Eigen::VectorXd scoring_seed = clamp_configuration(q_seed);
+  const Eigen::VectorXd scoring_neutral =
+      options.neutral_q.size() == 0 ? home_configuration()
+                                    : clamp_configuration(options.neutral_q);
+  const Eigen::VectorXd scoring_joint_weights =
+      options.joint_weights.size() == 0
+          ? Eigen::VectorXd::Ones(model_.nq)
+          : options.joint_weights;
+
+  auto normalized_distance = [&](const Eigen::VectorXd &a,
+                                 const Eigen::VectorXd &b,
+                                 bool weighted) {
+    Eigen::VectorXd difference = pinocchio::difference(model_, a, b);
+    double squared = 0.0;
+    for (int index = 0; index < model_.nq; ++index) {
+      double range = model_.upperPositionLimit[index] -
+                     model_.lowerPositionLimit[index];
+      if (!std::isfinite(range) || range <= 1e-9) {
+        range = 2.0 * M_PI;
+      } else {
+        // LeFranX ranks bounded revolute coordinates by their actual joint
+        // displacement.  Do not wrap a move across an asymmetric URDF limit
+        // into an artificially short angular distance.
+        difference[index] = a[index] - b[index];
+      }
+      const double weight = weighted ? scoring_joint_weights[index] : 1.0;
+      squared += weight * std::pow(difference[index] / range, 2.0);
+    }
+    return std::sqrt(std::max(0.0, squared));
+  };
+
+  struct CandidateRecord {
+    IKResult result;
+    double manipulability = 0.0;
+    double neutral_distance = 0.0;
+    double current_distance = 0.0;
+    double gate_distance = 0.0;
+    bool within_distance_gate = true;
+  };
+
+  auto make_record = [&](const IKResult &candidate) {
+    CandidateRecord record;
+    record.result = candidate;
+    record.current_distance =
+        normalized_distance(candidate.q, scoring_seed, true);
+    record.neutral_distance =
+        normalized_distance(candidate.q, scoring_neutral, false);
+    const Eigen::MatrixXd candidate_jacobian = jacobian(candidate.q);
+    const Eigen::VectorXd singular_values =
+        Eigen::JacobiSVD<Eigen::MatrixXd>(candidate_jacobian).singularValues();
+    record.manipulability = 1.0;
+    for (const double singular_value : singular_values) {
+      record.manipulability *= std::max(0.0, singular_value);
+    }
+    if (!std::isfinite(record.manipulability)) {
+      record.manipulability = 0.0;
+    }
+    record.gate_distance =
+        normalized_distance(candidate.q, scoring_seed, false);
+    record.within_distance_gate =
+        options.max_seed_distance <= 0.0 ||
+        record.gate_distance <= options.max_seed_distance;
+    return record;
+  };
+
   IKResult best = inverse_kinematics_once(target, q_seed, frame_id, options);
   best.attempts = 1;
-  if (best.success) {
+  if (!options.candidate_scoring_enabled && best.success) {
     return best;
+  }
+
+  std::vector<CandidateRecord> candidates;
+  if (options.candidate_scoring_enabled && best.success) {
+    candidates.push_back(make_record(best));
   }
 
   for (int retry = 0; retry < options.max_retries; ++retry) {
@@ -530,10 +639,72 @@ IKResult RobotModel::inverse_kinematics(const Eigen::Matrix4d &target_matrix,
     if (candidate.error < best.error) {
       best = candidate;
     }
-    if (candidate.success) {
+    if (options.candidate_scoring_enabled && candidate.success) {
+      candidates.push_back(make_record(candidate));
+    }
+    if (!options.candidate_scoring_enabled && candidate.success) {
       return candidate;
     }
   }
+
+  if (options.candidate_scoring_enabled && !candidates.empty()) {
+    bool any_within_gate = false;
+    for (const auto &candidate : candidates) {
+      any_within_gate = any_within_gate || candidate.within_distance_gate;
+    }
+
+    double best_score = -std::numeric_limits<double>::infinity();
+    int best_index = -1;
+    auto candidate_score = [&](const CandidateRecord &candidate) {
+      const double normalized_manipulability =
+          candidate.manipulability /
+          (candidate.manipulability + options.manipulability_scale);
+      return options.weight_manipulability * normalized_manipulability -
+             options.weight_neutral * candidate.neutral_distance -
+             options.weight_current * candidate.current_distance;
+    };
+    for (int index = 0; index < static_cast<int>(candidates.size()); ++index) {
+      const auto &candidate = candidates[static_cast<std::size_t>(index)];
+      if (any_within_gate && !candidate.within_distance_gate) {
+        continue;
+      }
+      if (!any_within_gate && options.max_seed_distance > 0.0) {
+        if (best_index >= 0 &&
+            candidate.gate_distance >=
+                candidates[static_cast<std::size_t>(best_index)].gate_distance) {
+          continue;
+        }
+        best_index = index;
+        continue;
+      }
+      const double score = candidate_score(candidate);
+      if (best_index < 0 || score > best_score) {
+        best_score = score;
+        best_index = index;
+      }
+    }
+    if (best_index >= 0) {
+      if (!any_within_gate && options.max_seed_distance > 0.0) {
+        best_score = candidate_score(
+            candidates[static_cast<std::size_t>(best_index)]);
+      }
+      CandidateRecord selected =
+          candidates[static_cast<std::size_t>(best_index)];
+      selected.result.score = best_score;
+      selected.result.manipulability = selected.manipulability;
+      selected.result.neutral_distance = selected.neutral_distance;
+      selected.result.current_distance = selected.current_distance;
+      if (options.max_seed_distance > 0.0 && !any_within_gate) {
+        // A hard continuity gate is useful for interactive control: a target
+        // that can only be reached by another branch must not silently switch
+        // the elbow.  Return the closest diagnostic candidate as unsuccessful;
+        // callers can retain the previous configuration.
+        selected.result.success = false;
+      }
+      best = selected.result;
+    }
+  }
+
   best.attempts = options.max_retries + 1;
   return best;
 }

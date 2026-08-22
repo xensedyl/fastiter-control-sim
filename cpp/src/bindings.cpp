@@ -26,12 +26,24 @@ PYBIND11_MODULE(_fr3_sim, module) {
       .def_readwrite("posture_gain", &IKOptions::posture_gain)
       .def_readwrite("line_search_steps", &IKOptions::line_search_steps)
       .def_readwrite("random_seed", &IKOptions::random_seed)
+      .def_readwrite("candidate_scoring_enabled",
+                     &IKOptions::candidate_scoring_enabled)
+      .def_readwrite("weight_manipulability", &IKOptions::weight_manipulability)
+      .def_readwrite("weight_neutral", &IKOptions::weight_neutral)
+      .def_readwrite("weight_current", &IKOptions::weight_current)
+      .def_readwrite("max_seed_distance", &IKOptions::max_seed_distance)
+      .def_readwrite("manipulability_scale", &IKOptions::manipulability_scale)
+      .def_readwrite("neutral_q", &IKOptions::neutral_q)
+      .def_readwrite("joint_weights", &IKOptions::joint_weights)
       .def("__repr__", [](const IKOptions &options) {
         return "IKOptions(max_iterations=" +
                std::to_string(options.max_iterations) +
                ", max_retries=" + std::to_string(options.max_retries) +
                ", tolerance=" + std::to_string(options.tolerance) +
                ", posture_gain=" + std::to_string(options.posture_gain) +
+               ", candidate_scoring_enabled=" +
+               std::string(options.candidate_scoring_enabled ? "True" : "False") +
+               ", weight_current=" + std::to_string(options.weight_current) +
                ")";
       });
 
@@ -43,6 +55,10 @@ PYBIND11_MODULE(_fr3_sim, module) {
       .def_readonly("error", &IKResult::error)
       .def_readonly("position_error", &IKResult::position_error)
       .def_readonly("orientation_error", &IKResult::orientation_error)
+      .def_readonly("score", &IKResult::score)
+      .def_readonly("manipulability", &IKResult::manipulability)
+      .def_readonly("neutral_distance", &IKResult::neutral_distance)
+      .def_readonly("current_distance", &IKResult::current_distance)
       .def("__repr__", [](const IKResult &result) {
         return "IKResult(success=" +
                std::string(result.success ? "True" : "False") +

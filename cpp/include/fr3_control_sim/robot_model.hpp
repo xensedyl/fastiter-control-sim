@@ -24,6 +24,16 @@ struct IKOptions {
   double posture_gain = 0.1;
   int line_search_steps = 8;
   unsigned int random_seed = 42;
+  // LeFranX-style ranking of all successful seed/retry solutions.  Set this
+  // to false to recover the original first-success behavior.
+  bool candidate_scoring_enabled = true;
+  double weight_manipulability = 0.05;
+  double weight_neutral = 0.1;
+  double weight_current = 1.0;
+  double max_seed_distance = 0.0; // normalized distance; 0 disables the gate
+  double manipulability_scale = 0.1;
+  Eigen::VectorXd neutral_q;       // empty: RobotModel::home_configuration()
+  Eigen::VectorXd joint_weights;   // empty: all ones
 };
 
 struct IKResult {
@@ -34,6 +44,10 @@ struct IKResult {
   double error = 0.0;
   double position_error = 0.0;
   double orientation_error = 0.0;
+  double score = -std::numeric_limits<double>::infinity();
+  double manipulability = 0.0;
+  double neutral_distance = 0.0;
+  double current_distance = 0.0;
 };
 
 // URDF adaptation of the weighted redundant-joint strategy used by

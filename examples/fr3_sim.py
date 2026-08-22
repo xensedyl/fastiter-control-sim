@@ -21,7 +21,12 @@ DEFAULT_DESCRIPTION_ROOT = Path(
 # Edit this value to change the default null-space home-posture constraint.
 # Set it to 0.0 to disable the constraint.  It can also be overridden with
 # the --posture-gain command-line option.
-DEFAULT_POSTURE_GAIN = 0.1
+DEFAULT_POSTURE_GAIN = float(fr3.IKOptions().posture_gain)
+DEFAULT_CANDIDATE_SCORING = bool(fr3.IKOptions().candidate_scoring_enabled)
+DEFAULT_WEIGHT_MANIPULABILITY = float(fr3.IKOptions().weight_manipulability)
+DEFAULT_WEIGHT_NEUTRAL = float(fr3.IKOptions().weight_neutral)
+DEFAULT_WEIGHT_CURRENT = float(fr3.IKOptions().weight_current)
+DEFAULT_MANIPULABILITY_SCALE = float(fr3.IKOptions().manipulability_scale)
 
 
 def _arguments() -> argparse.Namespace:
@@ -75,6 +80,29 @@ def _arguments() -> argparse.Namespace:
             f"Null-space home-posture gain for IK (default: "
             f"{DEFAULT_POSTURE_GAIN:g}; 0 disables the constraint)."
         ),
+    )
+    parser.add_argument(
+        "--candidate-scoring",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_CANDIDATE_SCORING,
+        help=(
+            "Rank successful Pinocchio IK candidates using manipulability, "
+            "neutral distance and seed distance (default: enabled)."
+        ),
+    )
+    parser.add_argument("--weight-manipulability", type=float,
+                        default=DEFAULT_WEIGHT_MANIPULABILITY)
+    parser.add_argument("--weight-neutral", type=float,
+                        default=DEFAULT_WEIGHT_NEUTRAL)
+    parser.add_argument("--weight-current", type=float,
+                        default=DEFAULT_WEIGHT_CURRENT)
+    parser.add_argument("--manipulability-scale", type=float,
+                        default=DEFAULT_MANIPULABILITY_SCALE)
+    parser.add_argument(
+        "--max-seed-distance",
+        type=float,
+        default=0.0,
+        help="Hard normalized seed-distance gate; 0 disables.",
     )
     parser.add_argument("--duration", type=float, default=2.0)
     parser.add_argument("--dt", type=float, default=0.02)
@@ -182,6 +210,12 @@ def _solve_ik(
     target_values: list[float] | None,
     posture_gain: float = DEFAULT_POSTURE_GAIN,
     ik_algorithm: str = "dls",
+    candidate_scoring: bool = DEFAULT_CANDIDATE_SCORING,
+    weight_manipulability: float = DEFAULT_WEIGHT_MANIPULABILITY,
+    weight_neutral: float = DEFAULT_WEIGHT_NEUTRAL,
+    weight_current: float = DEFAULT_WEIGHT_CURRENT,
+    max_seed_distance: float = 0.0,
+    manipulability_scale: float = DEFAULT_MANIPULABILITY_SCALE,
 ) -> np.ndarray:
     target = _make_target(model, home, target_values)
     _print_pose("target", target)
@@ -201,11 +235,41 @@ def _solve_ik(
         if not np.isfinite(posture_gain) or posture_gain < 0.0:
             raise ValueError("--posture-gain must be a finite non-negative number")
         options.posture_gain = float(posture_gain)
+        options.candidate_scoring_enabled = bool(candidate_scoring)
+        options.weight_manipulability = float(weight_manipulability)
+        options.weight_neutral = float(weight_neutral)
+        options.weight_current = float(weight_current)
+        options.max_seed_distance = float(max_seed_distance)
+        options.manipulability_scale = float(manipulability_scale)
+        if (
+            not np.isfinite(weight_manipulability)
+            or weight_manipulability < 0.0
+            or not np.isfinite(weight_neutral)
+            or weight_neutral < 0.0
+            or not np.isfinite(weight_current)
+            or weight_current < 0.0
+            or not np.isfinite(max_seed_distance)
+            or max_seed_distance < 0.0
+            or not np.isfinite(manipulability_scale)
+            or manipulability_scale <= 0.0
+        ):
+            raise ValueError("invalid candidate-scoring option")
         print(f"IK posture_gain (null-space): {options.posture_gain:.3f}")
+        print(
+            f"candidate scoring={options.candidate_scoring_enabled} "
+            f"weights(manip={options.weight_manipulability:g}, "
+            f"neutral={options.weight_neutral:g}, current={options.weight_current:g})"
+        )
         result = model.inverse_kinematics(target, home, options)
     error = getattr(result, "error", getattr(result, "residual", float("nan")))
     iterations = getattr(result, "iterations", -1)
     print(f"IK success={result.success} iterations={iterations} error={error:.3e}")
+    if ik_algorithm == "dls" and candidate_scoring:
+        print(
+            f"  score={result.score:.6g} manipulability={result.manipulability:.6g} "
+            f"neutral_distance={result.neutral_distance:.6g} "
+            f"current_distance={result.current_distance:.6g}"
+        )
     print(f"q [deg]: {np.array2string(np.degrees(result.q), precision=2)}")
     if not result.success:
         raise RuntimeError("inverse kinematics did not converge")
@@ -273,6 +337,12 @@ def _interactive_ik(
     dt: float,
     posture_gain: float = DEFAULT_POSTURE_GAIN,
     ik_algorithm: str = "dls",
+    candidate_scoring: bool = DEFAULT_CANDIDATE_SCORING,
+    weight_manipulability: float = DEFAULT_WEIGHT_MANIPULABILITY,
+    weight_neutral: float = DEFAULT_WEIGHT_NEUTRAL,
+    weight_current: float = DEFAULT_WEIGHT_CURRENT,
+    max_seed_distance: float = 0.0,
+    manipulability_scale: float = DEFAULT_MANIPULABILITY_SCALE,
 ) -> None:
     current = home.copy()
     if ik_algorithm == "lefranx-weighted":
@@ -282,6 +352,25 @@ def _interactive_ik(
         if not np.isfinite(posture_gain) or posture_gain < 0.0:
             raise ValueError("--posture-gain must be a finite non-negative number")
         options.posture_gain = float(posture_gain)
+        options.candidate_scoring_enabled = bool(candidate_scoring)
+        options.weight_manipulability = float(weight_manipulability)
+        options.weight_neutral = float(weight_neutral)
+        options.weight_current = float(weight_current)
+        options.max_seed_distance = float(max_seed_distance)
+        options.manipulability_scale = float(manipulability_scale)
+        if (
+            not np.isfinite(weight_manipulability)
+            or weight_manipulability < 0.0
+            or not np.isfinite(weight_neutral)
+            or weight_neutral < 0.0
+            or not np.isfinite(weight_current)
+            or weight_current < 0.0
+            or not np.isfinite(max_seed_distance)
+            or max_seed_distance < 0.0
+            or not np.isfinite(manipulability_scale)
+            or manipulability_scale <= 0.0
+        ):
+            raise ValueError("invalid candidate-scoring option")
     if visualizer is not None:
         visualizer.update(current)
 
@@ -345,6 +434,12 @@ def _interactive_ik(
             f"  [{status}] iterations={result.iterations} "
             f"{attempt_text} error={result.error:.3e}"
         )
+        if ik_algorithm == "dls" and options.candidate_scoring_enabled:
+            print(
+                f"  score={result.score:.6g} manip={result.manipulability:.6g} "
+                f"neutral={result.neutral_distance:.6g} "
+                f"current={result.current_distance:.6g}"
+            )
         print(f"  q [deg]: {np.array2string(np.degrees(result.q), precision=2)}")
         if not result.success:
             print()
@@ -389,6 +484,12 @@ def main() -> None:
         print("IK algorithm: LeFranX weighted free-joint search (URDF-adapted)")
     else:
         print(f"IK posture_gain (null-space): {args.posture_gain:g}")
+        print(
+            f"candidate scoring={args.candidate_scoring} "
+            f"weights(manip={args.weight_manipulability:g}, "
+            f"neutral={args.weight_neutral:g}, current={args.weight_current:g})"
+            f" manip_scale={args.manipulability_scale:g}"
+        )
 
     visualizer = None
     if not args.headless:
@@ -414,6 +515,12 @@ def main() -> None:
             args.dt,
             args.posture_gain,
             args.ik_algorithm,
+            args.candidate_scoring,
+            args.weight_manipulability,
+            args.weight_neutral,
+            args.weight_current,
+            args.max_seed_distance,
+            args.manipulability_scale,
         )
         return
 
@@ -421,7 +528,17 @@ def main() -> None:
         q_goal = _run_fk(model, home, args.q)
     else:
         q_goal = _solve_ik(
-            model, home, args.target, args.posture_gain, args.ik_algorithm
+            model,
+            home,
+            args.target,
+            args.posture_gain,
+            args.ik_algorithm,
+            args.candidate_scoring,
+            args.weight_manipulability,
+            args.weight_neutral,
+            args.weight_current,
+            args.max_seed_distance,
+            args.manipulability_scale,
         )
 
     if args.mode == "demo":

@@ -354,6 +354,42 @@ FR3 是 7 自由度机械臂，末端位姿任务只有 6 个约束。C++ IK 默
 
 `IKOptions.posture_gain` 控制约束强度，默认值为 `0.1`；设置为 `0.0` 可关闭零空间姿态约束。求解器会先收敛末端任务，进入位姿容差后再尽量优化零空间姿态，因此不会降低远距离目标的主任务优先级。较大的增益可能增加迭代次数；通常使用默认值即可。
 
+原有 Pinocchio IK 还支持一个可选的 LeFranX 风格候选选择层。它不替换
+DLS/Jlog6 主求解，而是在初始 seed 和 retry 得到多个精确候选后，按下式选择：
+
+```text
+score = weight_manipulability * normalized_manipulability
+        - weight_neutral * neutral_distance
+        - weight_current * current_distance
+```
+
+其中 `current_distance` 是候选与本次输入 `q_seed` 的关节范围归一化距离，
+`neutral_distance` 是候选与 home（或 `IKOptions.neutral_q`）的距离，
+`manipulability` 来自当前 URDF 的 Pinocchio Jacobian。这样连续拖动时可以优先
+保留上一帧的肘部支路，而不是直接采用第一个随机 retry 成功的解。
+
+默认已开启；要恢复旧的“第一个成功解”行为可设置：
+
+```bash
+python examples/fr3_sim.py --mode ik --no-candidate-scoring \
+  --target 0.35 0.10 0.45
+```
+
+常用调参示例：
+
+```bash
+python examples/fr3_sim.py --mode ik \
+  --candidate-scoring \
+  --weight-current 2.0 --weight-neutral 0.1 \
+  --weight-manipulability 0.05 \
+  --max-seed-distance 0.25
+```
+
+`max-seed-distance` 是硬连续性门限；如果所有候选都超过门限，IK 返回失败，
+调用者应保持上一帧关节角，从而避免跳到另一条肘部支路。`posture_gain` 与
+候选评分是两个独立机制：前者仍会在主任务收敛后拉向 home；需要最强连续性时，
+可先把 `posture_gain` 调小或设为 `0`，再提高 `weight-current`。
+
 ### Qt 滑条控制
 
 启动 Qt 控制面板和 MeshCat：
@@ -380,6 +416,9 @@ python examples/fr3_sim_qt.py \
 - `FK - Joint sliders`：拖动 `joint1` 到 `joint7`，单位为度；范围直接来自 C++ 模型中的关节限位。
 - `IK - XYZ / RPY sliders`：拖动 `x/y/z`（米）和 `roll/pitch/yaw`（弧度）；Qt 默认以最高 30 Hz 读取最新目标调用 C++ IK，并以 60 Hz 对关节显示做最小加加速度插值，因此连续拖动时也会持续跟随。
 - IK 页签中的 `posture_gain (null-space)` 可直接编辑零空间 home 姿态约束强度；改动后会自动重新求解，设置为 `0` 可关闭约束。
+- IK 页签还可编辑 `candidate scoring`、`manip`、`neutral`、`current` 权重和
+  `max distance`。建议 `current` 大于 `neutral`；`max distance` 设为 `0`
+  表示不启用硬门限。
 
 IK 页签以上一次成功解作为下一次求解初值。不可达目标会显示红色错误信息，并保持机器人上一次成功姿态不变。IK 成功后，FK 页签的关节滑条显示最新求解目标；MeshCat 中的机器人则显示正在插值的姿态。
 
@@ -441,8 +480,16 @@ target = pose_from_xyz_rpy(
     np.array([0.35, 0.10, 0.45]),
     np.array([3.1415926, 0.0, 0.2]),
 )
-result = model.inverse_kinematics(target, q0, IKOptions())
+ik_options = IKOptions()
+ik_options.candidate_scoring_enabled = True
+ik_options.weight_current = 2.0
+ik_options.weight_neutral = 0.1
+result = model.inverse_kinematics(target, q0, ik_options)
 trajectory = model.minimum_jerk_trajectory(q0, result.q, 2.0, 0.02)
+
+# Candidate-selection diagnostics:
+# result.score, result.current_distance, result.neutral_distance,
+# result.manipulability
 
 # LeFranX-style weighted redundant-joint adapter:
 from fr3_control_sim import FrankaWeightedIKOptions
