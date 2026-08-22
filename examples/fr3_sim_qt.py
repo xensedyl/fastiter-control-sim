@@ -172,6 +172,7 @@ class Fr3SimWindow(QMainWindow):
         *,
         initial_mode: str = "fk",
         posture_gain: float = DEFAULT_POSTURE_GAIN,
+        ik_algorithm: str = "dls",
         ik_update_hz: float = DEFAULT_IK_UPDATE_HZ,
         render_hz: float = DEFAULT_RENDER_HZ,
         smooth_time: float = DEFAULT_SMOOTH_TIME,
@@ -182,6 +183,9 @@ class Fr3SimWindow(QMainWindow):
         self.urdf_path = urdf_path
         self.home_q = np.asarray(model.home_configuration(), dtype=float)
         self.current_q = self.home_q.copy()
+        if ik_algorithm not in ("dls", "lefranx-weighted"):
+            raise ValueError(f"unknown IK algorithm: {ik_algorithm}")
+        self.ik_algorithm = ik_algorithm
         self.ik_options = fr3.IKOptions()
         if not np.isfinite(posture_gain) or posture_gain < 0.0:
             raise ValueError("--posture-gain must be a finite non-negative number")
@@ -349,6 +353,7 @@ class Fr3SimWindow(QMainWindow):
 
         options_group = QGroupBox("IK options")
         options_layout = QHBoxLayout(options_group)
+        options_layout.addWidget(QLabel(f"algorithm: {self.ik_algorithm}"))
         options_layout.addWidget(QLabel("posture_gain (null-space):"))
         self.posture_gain_spin_box = QDoubleSpinBox()
         self.posture_gain_spin_box.setRange(0.0, 10.0)
@@ -532,14 +537,35 @@ class Fr3SimWindow(QMainWindow):
         self._ik_pending = False
         try:
             target = self._target_pose()
-            result = self.model.inverse_kinematics(
-                target, self._animation_goal_q, self.ik_options
-            )
+            if self.ik_algorithm == "lefranx-weighted":
+                weighted_options = fr3.FrankaWeightedIKOptions()
+                # The grid is deliberately smaller in the GUI than in the
+                # standalone tool so a slider event keeps the Qt thread
+                # responsive.  The scoring policy is unchanged.
+                weighted_options.samples = 31
+                weighted_options.max_iterations = 80
+                weighted_options.weight_current = 2.0
+                result = self.model.franka_weighted_ik(
+                    target, self._animation_goal_q, weighted_options
+                )
+            else:
+                result = self.model.inverse_kinematics(
+                    target, self._animation_goal_q, self.ik_options
+                )
+            attempts = getattr(result, "attempts", None)
+            attempt_text = f" attempts={attempts}" if attempts is not None else ""
+            if self.ik_algorithm == "lefranx-weighted":
+                option_text = (
+                    f"score={result.score:.6g} valid_solutions="
+                    f"{result.valid_solutions} samples={result.samples_tested}"
+                )
+            else:
+                option_text = f"posture_gain={self.ik_options.posture_gain:.3f}"
             if not result.success:
                 self.ik_status.setText(
                     "IK not converged\n"
-                    f"posture_gain={self.ik_options.posture_gain:.3f}\n"
-                    f"iterations={result.iterations} attempts={result.attempts} "
+                    f"{option_text}\n"
+                    f"iterations={result.iterations}{attempt_text} "
                     f"error={result.error:.3e}\n"
                     f"position_error={result.position_error:.3e} "
                     f"orientation_error={result.orientation_error:.3e}"
@@ -557,8 +583,8 @@ class Fr3SimWindow(QMainWindow):
             )
             self.ik_status.setText(
                 "IK converged\n"
-                f"posture_gain={self.ik_options.posture_gain:.3f}\n"
-                f"iterations={result.iterations} attempts={result.attempts} "
+                f"{option_text}\n"
+                f"iterations={result.iterations}{attempt_text} "
                 f"error={result.error:.3e}\n"
                 f"q [deg] = {np.array2string(np.degrees(solved), precision=2)}\n"
                 + self._pose_text(solved_pose)
@@ -630,6 +656,12 @@ class Fr3SimWindow(QMainWindow):
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("fk", "ik"), default="fk")
+    parser.add_argument(
+        "--ik-algorithm",
+        choices=("dls", "lefranx-weighted"),
+        default="dls",
+        help="IK implementation used by the IK slider page.",
+    )
     parser.add_argument("--urdf", type=Path, help="Path to a 7-DoF robot URDF.")
     parser.add_argument(
         "--end-effector",
@@ -696,7 +728,10 @@ def main() -> int:
     description_root = args.description_root.expanduser().resolve()
     urdf_path = _resolve_urdf(args.urdf, description_root)
     model = fr3.RobotModel(str(urdf_path), args.end_effector)
-    print(f"IK posture_gain (null-space): {args.posture_gain:g}")
+    if args.ik_algorithm == "lefranx-weighted":
+        print("IK algorithm: LeFranX weighted free-joint search (URDF-adapted)")
+    else:
+        print(f"IK posture_gain (null-space): {args.posture_gain:g}")
     print(
         "Qt smoothing: "
         f"IK {args.ik_update_hz:g} Hz, render {args.render_hz:g} Hz, "
@@ -724,6 +759,7 @@ def main() -> int:
         urdf_path,
         initial_mode=args.mode,
         posture_gain=args.posture_gain,
+        ik_algorithm=args.ik_algorithm,
         ik_update_hz=args.ik_update_hz,
         render_hz=args.render_hz,
         smooth_time=args.smooth_time,

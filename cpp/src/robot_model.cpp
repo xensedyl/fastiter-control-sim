@@ -538,6 +538,289 @@ IKResult RobotModel::inverse_kinematics(const Eigen::Matrix4d &target_matrix,
   return best;
 }
 
+FrankaWeightedIKResult RobotModel::franka_weighted_ik(
+    const Eigen::Matrix4d &target_matrix, const Eigen::VectorXd &q_seed,
+    const FrankaWeightedIKOptions &options,
+    const std::string &frame_name) const {
+  validate_configuration(q_seed);
+  if (!is_finite_matrix(target_matrix)) {
+    throw std::invalid_argument("target contains NaN or infinity");
+  }
+  const Eigen::RowVector4d homogeneous_row(0.0, 0.0, 0.0, 1.0);
+  if (!target_matrix.row(3).isApprox(homogeneous_row, 1e-8)) {
+    throw std::invalid_argument("target last row must be [0, 0, 0, 1]");
+  }
+  const Eigen::Matrix3d rotation = target_matrix.topLeftCorner<3, 3>();
+  const double orthogonality_error =
+      (rotation.transpose() * rotation - Eigen::Matrix3d::Identity()).norm();
+  if (orthogonality_error > 1e-5 || rotation.determinant() <= 0.0) {
+    throw std::invalid_argument(
+        "target rotation must be a proper rotation matrix");
+  }
+  if (options.samples < 2 || options.max_iterations <= 0 ||
+      !std::isfinite(options.tolerance) || options.tolerance <= 0.0 ||
+      !std::isfinite(options.damping) || options.damping < 0.0 ||
+      !std::isfinite(options.step_size) || options.step_size <= 0.0 ||
+      !std::isfinite(options.max_step_norm) || options.max_step_norm < 0.0) {
+    throw std::invalid_argument("Invalid FrankaWeightedIKOptions");
+  }
+  for (const double weight : {options.weight_manipulability,
+                              options.weight_neutral,
+                              options.weight_current}) {
+    if (!std::isfinite(weight) || weight < 0.0) {
+      throw std::invalid_argument(
+          "Franka weighted IK weights must be finite and non-negative");
+    }
+  }
+  if ((options.neutral_q.size() != 0 &&
+       options.neutral_q.size() != model_.nq) ||
+      (options.joint_weights.size() != 0 &&
+       options.joint_weights.size() != model_.nq)) {
+    throw std::invalid_argument(
+        "neutral_q and joint_weights must be empty or have nq values");
+  }
+  if (options.neutral_q.size() != 0 &&
+      !options.neutral_q.array().isFinite().all()) {
+    throw std::invalid_argument("neutral_q contains NaN or infinity");
+  }
+  if (options.joint_weights.size() != 0) {
+    if (!options.joint_weights.array().isFinite().all() ||
+        (options.joint_weights.array() < 0.0).any()) {
+      throw std::invalid_argument(
+          "joint_weights must be finite and non-negative");
+    }
+  }
+
+  const auto frame_id = resolve_frame(frame_name);
+  const pinocchio::SE3 target(
+      rotation, target_matrix.topRightCorner<3, 1>());
+  const Eigen::VectorXd q_current = clamp_configuration(q_seed);
+  const Eigen::VectorXd neutral =
+      options.neutral_q.size() == 0 ? home_configuration()
+                                    : clamp_configuration(options.neutral_q);
+  const Eigen::VectorXd joint_weights =
+      options.joint_weights.size() == 0
+          ? Eigen::VectorXd::Ones(model_.nq)
+          : options.joint_weights;
+
+  // The original LeFranX solver uses q7 as its one-dimensional free
+  // variable.  For a generic URDF adapter, prefer a joint named joint_7 and
+  // otherwise fall back to the final independent coordinate.
+  int free_index = options.free_joint_index;
+  if (free_index < 0) {
+    const auto names = joint_names();
+    for (int index = 0; index < static_cast<int>(names.size()); ++index) {
+      if (names[static_cast<std::size_t>(index)] == "joint_7" ||
+          names[static_cast<std::size_t>(index)] == "fr3_joint7") {
+        free_index = index;
+        break;
+      }
+    }
+    if (free_index < 0) {
+      free_index = model_.nq - 1;
+    }
+  }
+  if (free_index < 0 || free_index >= model_.nq) {
+    throw std::invalid_argument("free_joint_index is outside q dimensions");
+  }
+
+  auto finite_limit = [&](double value, double fallback) {
+    return std::isfinite(value) ? value : fallback;
+  };
+  double free_lower = finite_limit(model_.lowerPositionLimit[free_index],
+                                   -M_PI);
+  double free_upper = finite_limit(model_.upperPositionLimit[free_index], M_PI);
+  if (!(free_upper > free_lower)) {
+    throw std::invalid_argument("free joint has invalid position limits");
+  }
+
+  FrankaWeightedIKResult result;
+  result.q = q_current;
+  result.free_joint_index = free_index;
+  const ErrorState initial_state = pose_error(q_current, target, frame_id);
+  result.error = initial_state.norm;
+  result.position_error = initial_state.position_norm;
+  result.orientation_error = initial_state.orientation_norm;
+
+  auto normalized_distance = [&](const Eigen::VectorXd &a,
+                                 const Eigen::VectorXd &b,
+                                 bool weighted) {
+    const Eigen::VectorXd difference = pinocchio::difference(model_, a, b);
+    double squared = 0.0;
+    for (int index = 0; index < model_.nq; ++index) {
+      double lower = model_.lowerPositionLimit[index];
+      double upper = model_.upperPositionLimit[index];
+      double range = upper - lower;
+      if (!std::isfinite(range) || range <= 1e-9) {
+        range = 2.0 * M_PI;
+      }
+      const double weight = weighted ? joint_weights[index] : 1.0;
+      squared += weight * std::pow(difference[index] / range, 2.0);
+    }
+    return std::sqrt(std::max(0.0, squared));
+  };
+
+  auto score_candidate = [&](const Eigen::VectorXd &candidate,
+                             double &manipulability,
+                             double &neutral_distance,
+                             double &current_distance) {
+    const Eigen::MatrixXd candidate_jacobian = jacobian(candidate, frame_name);
+    const Eigen::MatrixXd jjt =
+        candidate_jacobian * candidate_jacobian.transpose();
+    const double determinant = jjt.determinant();
+    manipulability = determinant > 0.0 ? std::sqrt(determinant) : 0.0;
+    neutral_distance = normalized_distance(candidate, neutral, false);
+    current_distance = normalized_distance(candidate, q_current, true);
+    return options.weight_manipulability * manipulability -
+           options.weight_neutral * neutral_distance -
+           options.weight_current * current_distance;
+  };
+
+  auto solve_fixed_free = [&](const Eigen::VectorXd &seed, double free_value,
+                              Eigen::VectorXd &solved, ErrorState &solved_state,
+                              int &iterations) {
+    Eigen::VectorXd q = clamp_configuration(seed);
+    q[free_index] = std::clamp(free_value, free_lower, free_upper);
+    ErrorState state = pose_error(q, target, frame_id);
+    iterations = 0;
+    int stalled = 0;
+    for (; iterations < options.max_iterations; ++iterations) {
+      if (state.norm <= options.tolerance) {
+        solved = q;
+        solved_state = state;
+        return true;
+      }
+
+      pinocchio::computeJointJacobians(model_, data_, q);
+      pinocchio::updateFramePlacements(model_, data_);
+      pinocchio::Data::Matrix6x local_jacobian(6, model_.nv);
+      local_jacobian.setZero();
+      pinocchio::getFrameJacobian(model_, data_, frame_id, pinocchio::LOCAL,
+                                  local_jacobian);
+      const pinocchio::SE3 current_to_target =
+          data_.oMf[frame_id].inverse() * target;
+      const Eigen::MatrixXd task_jacobian =
+          -pinocchio::Jlog6(current_to_target.inverse()) * local_jacobian;
+
+      std::vector<int> free_columns;
+      free_columns.reserve(static_cast<std::size_t>(model_.nv - 1));
+      for (int index = 0; index < model_.nv; ++index) {
+        if (index != free_index) {
+          free_columns.push_back(index);
+        }
+      }
+      Eigen::MatrixXd reduced_jacobian(6, model_.nv - 1);
+      for (int column = 0; column < reduced_jacobian.cols(); ++column) {
+        reduced_jacobian.col(column) =
+            task_jacobian.col(free_columns[static_cast<std::size_t>(column)]);
+      }
+      Eigen::MatrixXd normal =
+          reduced_jacobian * reduced_jacobian.transpose();
+      normal.diagonal().array() += options.damping;
+      Eigen::VectorXd reduced_delta =
+          -options.step_size * reduced_jacobian.transpose() *
+          normal.ldlt().solve(state.vector);
+      if (!reduced_delta.array().isFinite().all()) {
+        break;
+      }
+
+      Eigen::VectorXd delta = Eigen::VectorXd::Zero(model_.nv);
+      for (int column = 0; column < reduced_delta.size(); ++column) {
+        delta[free_columns[static_cast<std::size_t>(column)]] =
+            reduced_delta[column];
+      }
+      const double delta_norm = delta.norm();
+      if (options.max_step_norm > 0.0 && delta_norm > options.max_step_norm) {
+        delta *= options.max_step_norm / delta_norm;
+      }
+
+      bool improved = false;
+      double alpha = 1.0;
+      for (int line = 0; line < 10; ++line) {
+        Eigen::VectorXd candidate =
+            pinocchio::integrate(model_, q, alpha * delta);
+        candidate = clamp_configuration(candidate);
+        candidate[free_index] = std::clamp(free_value, free_lower, free_upper);
+        const ErrorState candidate_state =
+            pose_error(candidate, target, frame_id);
+        if (candidate_state.norm + 1e-12 < state.norm) {
+          q = candidate;
+          state = candidate_state;
+          improved = true;
+          break;
+        }
+        alpha *= 0.5;
+      }
+      if (!improved) {
+        ++stalled;
+        if (stalled >= 3) {
+          break;
+        }
+      } else {
+        stalled = 0;
+      }
+    }
+    solved = q;
+    solved_state = state;
+    return state.norm <= options.tolerance;
+  };
+
+  std::vector<double> free_values;
+  free_values.reserve(static_cast<std::size_t>(options.samples) + 1U);
+  for (int sample = 0; sample < options.samples; ++sample) {
+    const double fraction = static_cast<double>(sample) /
+                            static_cast<double>(options.samples - 1);
+    free_values.push_back(free_lower + fraction * (free_upper - free_lower));
+  }
+  free_values.push_back(std::clamp(q_current[free_index], free_lower, free_upper));
+  std::sort(free_values.begin(), free_values.end());
+  free_values.erase(
+      std::unique(free_values.begin(), free_values.end(),
+                  [](double a, double b) { return std::abs(a - b) < 1e-12; }),
+      free_values.end());
+
+  const Eigen::VectorXd home = home_configuration();
+  for (const double free_value : free_values) {
+    ++result.samples_tested;
+    std::vector<Eigen::VectorXd> seeds;
+    seeds.push_back(q_current);
+    if ((home - q_current).norm() > 1e-9) {
+      seeds.push_back(home);
+    }
+    for (const Eigen::VectorXd &seed : seeds) {
+      Eigen::VectorXd candidate;
+      ErrorState candidate_state;
+      int candidate_iterations = 0;
+      if (!solve_fixed_free(seed, free_value, candidate, candidate_state,
+                            candidate_iterations)) {
+        continue;
+      }
+      ++result.valid_solutions;
+      double manipulability = 0.0;
+      double neutral_distance = 0.0;
+      double current_distance = 0.0;
+      const double score = score_candidate(
+          candidate, manipulability, neutral_distance, current_distance);
+      if (!std::isfinite(score)) {
+        continue;
+      }
+      if (!result.success || score > result.score) {
+        result.success = true;
+        result.q = candidate;
+        result.score = score;
+        result.manipulability = manipulability;
+        result.neutral_distance = neutral_distance;
+        result.current_distance = current_distance;
+        result.error = candidate_state.norm;
+        result.position_error = candidate_state.position_norm;
+        result.orientation_error = candidate_state.orientation_norm;
+        result.iterations = candidate_iterations;
+      }
+    }
+  }
+  return result;
+}
+
 Eigen::MatrixXd
 RobotModel::minimum_jerk_trajectory(const Eigen::VectorXd &q_start,
                                     const Eigen::VectorXd &q_goal,

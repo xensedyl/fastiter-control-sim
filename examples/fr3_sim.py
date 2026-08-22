@@ -27,6 +27,15 @@ DEFAULT_POSTURE_GAIN = 0.1
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("demo", "fk", "ik"), default="demo")
+    parser.add_argument(
+        "--ik-algorithm",
+        choices=("dls", "lefranx-weighted"),
+        default="dls",
+        help=(
+            "IK implementation for --mode ik: existing damped solver or "
+            "LeFranX-style weighted free-joint search."
+        ),
+    )
     parser.add_argument("--headless", action="store_true", help="Run without MeshCat.")
     parser.add_argument(
         "--no-open-browser",
@@ -172,15 +181,28 @@ def _solve_ik(
     home: np.ndarray,
     target_values: list[float] | None,
     posture_gain: float = DEFAULT_POSTURE_GAIN,
+    ik_algorithm: str = "dls",
 ) -> np.ndarray:
     target = _make_target(model, home, target_values)
     _print_pose("target", target)
-    options = fr3.IKOptions()
-    if not np.isfinite(posture_gain) or posture_gain < 0.0:
-        raise ValueError("--posture-gain must be a finite non-negative number")
-    options.posture_gain = float(posture_gain)
-    print(f"IK posture_gain (null-space): {options.posture_gain:.3f}")
-    result = model.inverse_kinematics(target, home, options)
+    if ik_algorithm == "lefranx-weighted":
+        options = fr3.FrankaWeightedIKOptions()
+        options.weight_current = 2.0
+        print("IK algorithm: LeFranX weighted free-joint search (URDF-adapted)")
+        result = model.franka_weighted_ik(target, home, options)
+        print(
+            f"IK score={result.score:.6g} manipulability={result.manipulability:.6g} "
+            f"neutral_distance={result.neutral_distance:.6g} "
+            f"current_distance={result.current_distance:.6g} "
+            f"valid_solutions={result.valid_solutions}"
+        )
+    else:
+        options = fr3.IKOptions()
+        if not np.isfinite(posture_gain) or posture_gain < 0.0:
+            raise ValueError("--posture-gain must be a finite non-negative number")
+        options.posture_gain = float(posture_gain)
+        print(f"IK posture_gain (null-space): {options.posture_gain:.3f}")
+        result = model.inverse_kinematics(target, home, options)
     error = getattr(result, "error", getattr(result, "residual", float("nan")))
     iterations = getattr(result, "iterations", -1)
     print(f"IK success={result.success} iterations={iterations} error={error:.3e}")
@@ -250,20 +272,25 @@ def _interactive_ik(
     duration: float,
     dt: float,
     posture_gain: float = DEFAULT_POSTURE_GAIN,
+    ik_algorithm: str = "dls",
 ) -> None:
     current = home.copy()
-    options = fr3.IKOptions()
-    if not np.isfinite(posture_gain) or posture_gain < 0.0:
-        raise ValueError("--posture-gain must be a finite non-negative number")
-    options.posture_gain = float(posture_gain)
+    if ik_algorithm == "lefranx-weighted":
+        print("  algorithm: LeFranX weighted free-joint search (URDF-adapted)")
+    else:
+        options = fr3.IKOptions()
+        if not np.isfinite(posture_gain) or posture_gain < 0.0:
+            raise ValueError("--posture-gain must be a finite non-negative number")
+        options.posture_gain = float(posture_gain)
     if visualizer is not None:
         visualizer.update(current)
 
     print("\nInteractive IK: input a target pose.")
-    print(
-        f"  posture_gain (null-space): {options.posture_gain:.3f} "
-        "(set with --posture-gain; 0 disables)"
-    )
+    if ik_algorithm == "dls":
+        print(
+            f"  posture_gain (null-space): {options.posture_gain:.3f} "
+            "(set with --posture-gain; 0 disables)"
+        )
     print("  x y z                    (meters; keep current orientation)")
     print("  x y z roll pitch yaw     (meters + radians)")
     print("  example: 0.35 0.10 0.45")
@@ -301,11 +328,22 @@ def _interactive_ik(
             continue
 
         target = _make_target(model, current, values)
-        result = model.inverse_kinematics(target, current, options)
+        if ik_algorithm == "lefranx-weighted":
+            weighted_options = fr3.FrankaWeightedIKOptions()
+            weighted_options.weight_current = 2.0
+            result = model.franka_weighted_ik(target, current, weighted_options)
+            print(
+                f"  score={result.score:.6g} valid_solutions="
+                f"{result.valid_solutions} samples={result.samples_tested}"
+            )
+        else:
+            result = model.inverse_kinematics(target, current, options)
         status = "converged" if result.success else "not converged"
+        attempts = getattr(result, "attempts", None)
+        attempt_text = f" attempts={attempts}" if attempts is not None else ""
         print(
             f"  [{status}] iterations={result.iterations} "
-            f"attempts={result.attempts} error={result.error:.3e}"
+            f"{attempt_text} error={result.error:.3e}"
         )
         print(f"  q [deg]: {np.array2string(np.degrees(result.q), precision=2)}")
         if not result.success:
@@ -347,7 +385,10 @@ def main() -> None:
     mimic_names = list(getattr(model, "mimic_joint_names", ()))
     if mimic_names:
         print(f"mimic joints: {', '.join(mimic_names)}")
-    print(f"IK posture_gain (null-space): {args.posture_gain:g}")
+    if args.ik_algorithm == "lefranx-weighted":
+        print("IK algorithm: LeFranX weighted free-joint search (URDF-adapted)")
+    else:
+        print(f"IK posture_gain (null-space): {args.posture_gain:g}")
 
     visualizer = None
     if not args.headless:
@@ -372,13 +413,16 @@ def main() -> None:
             args.duration,
             args.dt,
             args.posture_gain,
+            args.ik_algorithm,
         )
         return
 
     if args.mode == "fk":
         q_goal = _run_fk(model, home, args.q)
     else:
-        q_goal = _solve_ik(model, home, args.target, args.posture_gain)
+        q_goal = _solve_ik(
+            model, home, args.target, args.posture_gain, args.ik_algorithm
+        )
 
     if args.mode == "demo":
         _print_pose("home", model.forward_kinematics(home))

@@ -7,6 +7,7 @@
 #include <pinocchio/multibody/model.hpp>
 
 #include <map>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -33,6 +34,42 @@ struct IKResult {
   double error = 0.0;
   double position_error = 0.0;
   double orientation_error = 0.0;
+};
+
+// URDF adaptation of the weighted redundant-joint strategy used by
+// LeFranX/franka_xhand_teleoperator.  This is intentionally separate from
+// IKOptions/inverse_kinematics(): the latter is the project's original
+// damped iterative solver, while this API scans one free joint, solves the
+// remaining six coordinates, and ranks valid candidates.
+struct FrankaWeightedIKOptions {
+  int free_joint_index = -1;       // -1: joint_7 when present, otherwise nq-1
+  int samples = 121;               // grid points over the free-joint limits
+  int max_iterations = 80;        // fixed-free local solve iterations
+  double tolerance = 1e-5;
+  double damping = 1e-6;
+  double step_size = 0.7;
+  double max_step_norm = 0.25;
+  double weight_manipulability = 1.0;
+  double weight_neutral = 1.0;
+  double weight_current = 1.0;
+  Eigen::VectorXd neutral_q;       // empty: RobotModel::home_configuration()
+  Eigen::VectorXd joint_weights;   // empty: all ones
+};
+
+struct FrankaWeightedIKResult {
+  Eigen::VectorXd q;
+  bool success = false;
+  double score = -std::numeric_limits<double>::infinity();
+  double manipulability = 0.0;
+  double neutral_distance = 0.0;
+  double current_distance = 0.0;
+  double error = std::numeric_limits<double>::infinity();
+  double position_error = std::numeric_limits<double>::infinity();
+  double orientation_error = std::numeric_limits<double>::infinity();
+  int free_joint_index = -1;
+  int samples_tested = 0;
+  int valid_solutions = 0;
+  int iterations = 0;
 };
 
 class RobotModel {
@@ -65,6 +102,24 @@ public:
   IKResult inverse_kinematics(const Eigen::Matrix4d &target,
                               const Eigen::VectorXd &q_seed,
                               const IKOptions &options = IKOptions()) const;
+
+  // LeFranX-style weighted redundant-joint IK adapted to this URDF.  The
+  // analytic geofik formulas in the original project are hard-coded for the
+  // official Franka dimensions and therefore are not used here.  Instead,
+  // this method keeps its free-joint scan and weighted candidate ranking while
+  // obtaining FK/Jacobians from the loaded URDF (including mimic joints).
+  FrankaWeightedIKResult franka_weighted_ik(
+      const Eigen::Matrix4d &target, const Eigen::VectorXd &q_seed,
+      const FrankaWeightedIKOptions &options = FrankaWeightedIKOptions(),
+      const std::string &frame_name = "") const;
+
+  // Descriptive alias matching the source algorithm's project name.
+  FrankaWeightedIKResult lefranx_weighted_ik(
+      const Eigen::Matrix4d &target, const Eigen::VectorXd &q_seed,
+      const FrankaWeightedIKOptions &options = FrankaWeightedIKOptions(),
+      const std::string &frame_name = "") const {
+    return franka_weighted_ik(target, q_seed, options, frame_name);
+  }
 
   Eigen::MatrixXd minimum_jerk_trajectory(const Eigen::VectorXd &q_start,
                                           const Eigen::VectorXd &q_goal,

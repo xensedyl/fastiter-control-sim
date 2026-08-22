@@ -312,6 +312,38 @@ python examples/fr3_sim.py --mode ik \
 
 IK 成功后，C++ 会生成 50 Hz 最小加加速度关节轨迹，并由 MeshCat 播放。
 
+### LeFranX 加权冗余 IK
+
+LeFranX 的 IK 源码实际位于同仓库的
+`/home/xense/fastiter/LeFranX/franka_xhand_teleoperator`，而不是
+`franka_server` 目录本身。原始 `geofik` 解析公式把官方 Franka 的连杆尺寸和
+TCP 偏置写死，不能直接用于 `models/URDF0820/URDF0820.urdf`。
+
+本工程提供了一个独立的 URDF 适配入口。它保留 LeFranX `weighted_ik` 的核心策略：
+扫描一个冗余关节、对每个候选求末端位姿、按可操作度/中立姿态距离/当前姿态距离
+加权选解；FK、Jacobian 和 URDF `<mimic>` 关系全部来自当前 Pinocchio 模型。
+它不是官方硬编码解析公式的逐行复制，但输出与所加载 URDF 的 FK 一致。
+
+```bash
+python examples/franka_weighted_ik.py \
+  --urdf models/URDF0820/URDF0820.urdf
+```
+
+也可以在现有命令行示例中选择该算法：
+
+```bash
+python examples/fr3_sim.py --headless --mode ik \
+  --ik-algorithm lefranx-weighted \
+  --urdf models/URDF0820/URDF0820.urdf \
+  --target -0.1491 0.0001 0.6846 -1.5708 -0.7854 -1.5708
+```
+
+`FrankaWeightedIKOptions` 中的 `weight_manipulability`、`weight_neutral` 和
+`weight_current` 分别对应 LeFranX 的三项评分；`samples` 控制自由关节扫描密度。
+当前默认自由关节为 `joint_7`（没有该名称时使用最后一个独立关节）。
+
+该算法是局部数值适配器，不承诺对所有不可达目标找到解；增大扫描密度会增加计算时间。
+
 FR3 是 7 自由度机械臂，末端位姿任务只有 6 个约束。C++ IK 默认在 Jacobian 零空间中加入 home 姿态约束，使冗余肘部姿态趋向：
 
 ```text
@@ -329,6 +361,19 @@ FR3 是 7 自由度机械臂，末端位姿任务只有 6 个约束。C++ IK 默
 ```bash
 python examples/fr3_sim_qt.py
 ```
+
+Qt 中也可以直接选择 LeFranX 加权冗余 IK（当前 URDF 适配版）：
+
+```bash
+python examples/fr3_sim_qt.py \
+  --mode ik \
+  --ik-algorithm lefranx-weighted \
+  --urdf models/URDF0820/URDF0820.urdf
+```
+
+此模式的每次滑条求解会显示 `score`、可操作度、有效候选数和扫描样本数。
+`posture_gain` 控件只属于原有 DLS 模式；LeFranX 模式使用
+`FrankaWeightedIKOptions` 的三项权重。
 
 窗口包含两个页签：
 
@@ -398,6 +443,15 @@ target = pose_from_xyz_rpy(
 )
 result = model.inverse_kinematics(target, q0, IKOptions())
 trajectory = model.minimum_jerk_trajectory(q0, result.q, 2.0, 0.02)
+
+# LeFranX-style weighted redundant-joint adapter:
+from fr3_control_sim import FrankaWeightedIKOptions
+
+weighted_options = FrankaWeightedIKOptions()
+weighted_options.weight_current = 2.0
+weighted_result = model.franka_weighted_ik(target, q0, weighted_options)
+# The descriptive alias is also available:
+# weighted_result = model.lefranx_weighted_ik(target, q0, weighted_options)
 ```
 
 加载 CAD 模型时不需要额外参数，末端会自动选择为 `link_7`：

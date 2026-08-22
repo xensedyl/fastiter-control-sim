@@ -38,6 +38,17 @@ def _test_cad_urdf() -> None:
     recovered = np.asarray(model.forward_kinematics(result.q), dtype=float)
     assert np.linalg.norm(recovered[:3, 3] - target[:3, 3]) < 1e-5
 
+    weighted_options = fr3.FrankaWeightedIKOptions()
+    weighted_options.samples = 21
+    weighted_options.max_iterations = 80
+    weighted_options.weight_current = 2.0
+    weighted_result = model.franka_weighted_ik(target, home, weighted_options)
+    assert weighted_result.success, weighted_result
+    weighted_recovered = np.asarray(
+        model.forward_kinematics(weighted_result.q), dtype=float
+    )
+    assert np.linalg.norm(weighted_recovered[:3, 3] - target[:3, 3]) < 2e-5
+
     # The CAD URDF deliberately uses paths relative to its own directory.
     from fr3_control_sim.visualizer import _parse_visuals
 
@@ -45,6 +56,22 @@ def _test_cad_urdf() -> None:
     assert len(visuals) == 8
     assert all(visual.geometry_kind == "mesh" for visual in visuals)
     assert all(Path(visual.geometry_data).is_file() for visual in visuals)
+
+
+def _test_franka_weighted(model: fr3.RobotModel) -> None:
+    """Exercise the URDF-backed LeFranX weighted free-joint adapter."""
+    home = np.asarray(model.home_configuration(), dtype=float)
+    target_q = home + np.radians([2.0, -2.0, 2.0, 1.0, 2.0, -1.0, 2.0])
+    target = np.asarray(model.forward_kinematics(target_q), dtype=float)
+    options = fr3.FrankaWeightedIKOptions()
+    options.samples = 21
+    options.max_iterations = 80
+    options.weight_current = 2.0
+    result = model.franka_weighted_ik(target, home, options)
+    assert result.success, result
+    assert result.valid_solutions > 0
+    solved = np.asarray(model.forward_kinematics(result.q), dtype=float)
+    assert np.linalg.norm(solved[:3, 3] - target[:3, 3]) < 2e-5
 
 
 def _test_urdf0820_if_present() -> None:
@@ -129,6 +156,7 @@ def main() -> None:
 
     _test_cad_urdf()
     _test_urdf0820_if_present()
+    _test_franka_weighted(model)
 
     print("Python/pybind smoke test passed")
     print(f"  IK residual: {result.error:.3e}")

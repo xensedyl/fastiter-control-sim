@@ -1,6 +1,8 @@
 """Python bindings for the C++ FR3 kinematics and trajectory core."""
 
 from ._fr3_sim import (
+    FrankaWeightedIKOptions,
+    FrankaWeightedIKResult,
     IKOptions,
     IKResult,
     RobotModel,
@@ -9,6 +11,8 @@ from ._fr3_sim import (
 )
 
 __all__ = [
+    "FrankaWeightedIKOptions",
+    "FrankaWeightedIKResult",
     "IKOptions",
     "IKResult",
     "RobotModel",
